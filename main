@@ -5102,7 +5102,7 @@ end))
 
 -- Silent facing helper: yaw-faces our character toward targetPos. Shared by the
 -- RenderStepped lock loop and the Heartbeat enforcer below, both suspended
--- while sprinting backwards (see isSprintingBackwards).
+-- while sprint-strafing (see isSprintPause).
 -- Root cause of the old failure: ABA's own client loop hard-snaps the root to the
 -- CAMERA facing every frame (except while sprinting, which is why silent only
 -- appeared to work while running). It skips the snap while a "NoRotate" state
@@ -5151,13 +5151,15 @@ local function clearSilentNoRotate()
 	end
 end
 
--- Sprint-back check: silent facing pauses while sprinting backwards
--- (Shift + S) and runs at all other times.
-local function isSprintingBackwards()
+-- Sprint-pause check: silent facing pauses while sprint-strafing
+-- (Shift + A/D/S) and runs at all other times, including sprinting forward.
+local function isSprintPause()
 	local shift = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift)
 		or UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
 	if not shift then return false end
 	return UserInputService:IsKeyDown(Enum.KeyCode.S)
+		or UserInputService:IsKeyDown(Enum.KeyCode.A)
+		or UserInputService:IsKeyDown(Enum.KeyCode.D)
 end
 
 -- NOTE (retired): redirecting UseMove packets (targ/mousehit/camdir) was tested
@@ -5192,8 +5194,8 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 
 	if lockMode == "Silent" then
 		-- Silent: camera never moves; our character yaw-faces the target,
-		-- pausing only while sprinting backwards.
-		if not isSprintingBackwards() then
+		-- pausing only while sprint-strafing.
+		if not isSprintPause() then
 			applySilentFacing(targetPos)
 		end
 		return
@@ -5214,7 +5216,7 @@ table.insert(connections, RunService.Heartbeat:Connect(function()
 	if silentOn then
 		local targetPlayer = Players:GetPlayerFromCharacter(lockedTarget.Parent)
 		if not (teamCheckEnabled and targetPlayer and isTeammate(targetPlayer)) then
-			if not isSprintingBackwards() then
+			if not isSprintPause() then
 				targetPos = lockedTarget.Position
 				if predictionEnabled then
 					targetPos = targetPos + lockedTarget.Velocity * predictionStrength
