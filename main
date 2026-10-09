@@ -5101,7 +5101,8 @@ table.insert(connections, minimizeButton.MouseButton1Click:Connect(function()
 end))
 
 -- Silent facing helper: yaw-faces our character toward targetPos. Shared by the
--- RenderStepped lock loop and the Heartbeat enforcer below.
+-- RenderStepped lock loop and the Heartbeat enforcer below, both suspended
+-- while sprinting backwards (see isSprintingBackwards).
 -- Root cause of the old failure: ABA's own client loop hard-snaps the root to the
 -- CAMERA facing every frame (except while sprinting, which is why silent only
 -- appeared to work while running). It skips the snap while a "NoRotate" state
@@ -5150,6 +5151,15 @@ local function clearSilentNoRotate()
 	end
 end
 
+-- Sprint-back check: silent facing pauses while sprinting backwards
+-- (Shift + S) and runs at all other times.
+local function isSprintingBackwards()
+	local shift = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift)
+		or UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
+	if not shift then return false end
+	return UserInputService:IsKeyDown(Enum.KeyCode.S)
+end
+
 -- NOTE (retired): redirecting UseMove packets (targ/mousehit/camdir) was tested
 -- live and the server drops every mutated packet while accepting identical
 -- genuine ones, so packet spoofing cannot deliver target-locked moves on this
@@ -5181,8 +5191,11 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 	end
 
 	if lockMode == "Silent" then
-		-- Silent: camera never moves; our character yaw-faces the target instead.
-		applySilentFacing(targetPos)
+		-- Silent: camera never moves; our character yaw-faces the target,
+		-- pausing only while sprinting backwards.
+		if not isSprintingBackwards() then
+			applySilentFacing(targetPos)
+		end
 		return
 	end
 
@@ -5196,7 +5209,21 @@ end))
 table.insert(connections, RunService.Heartbeat:Connect(function()
 	local silentOn = guiEnabled and active and lockMode == "Silent"
 		and lockedTarget and lockedTarget.Parent
-	if not silentOn then
+	local faceNow = false
+	local targetPos = nil
+	if silentOn then
+		local targetPlayer = Players:GetPlayerFromCharacter(lockedTarget.Parent)
+		if not (teamCheckEnabled and targetPlayer and isTeammate(targetPlayer)) then
+			if not isSprintingBackwards() then
+				targetPos = lockedTarget.Position
+				if predictionEnabled then
+					targetPos = targetPos + lockedTarget.Velocity * predictionStrength
+				end
+				faceNow = true
+			end
+		end
+	end
+	if not faceNow then
 		clearSilentNoRotate()
 		if silentRotateOff then
 			silentRotateOff = false
@@ -5209,14 +5236,7 @@ table.insert(connections, RunService.Heartbeat:Connect(function()
 		return
 	end
 
-	local targetPlayer = Players:GetPlayerFromCharacter(lockedTarget.Parent)
-	if teamCheckEnabled and targetPlayer and isTeammate(targetPlayer) then return end
-
 	ensureSilentNoRotate(LocalPlayer.Character)
-	local targetPos = lockedTarget.Position
-	if predictionEnabled then
-		targetPos = targetPos + lockedTarget.Velocity * predictionStrength
-	end
 	applySilentFacing(targetPos)
 end))
 
