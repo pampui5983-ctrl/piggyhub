@@ -123,7 +123,17 @@ local lastCounterTime = 0
 local blockGen = 0
 local counterGen = 0
 local userHoldingF = false
-local lastScriptFTime = 0
+-- Exact echo accounting for synthetic F presses (measured live: every virtual
+-- press echoes exactly once into InputBegan/InputEnded, and IsKeyDown tracks
+-- the virtual state, so timestamps + IsKeyDown polling cannot be trusted).
+-- Each script press expects exactly one echo; a genuine finger event is only
+-- consumed while its echo is still unarrived-but-fresh, which self-corrects in
+-- either arrival order. Stale expectations expire (dropped echo safety).
+local pendingDownEcho = 0
+local pendingUpEcho = 0
+local lastDownStamp = 0
+local lastUpStamp = 0
+local ECHO_WINDOW = 0.25
 local lastBlockedAnims = {}
 local activeConnections = {}
 local autoCounterToggleObj = nil
@@ -173,29 +183,37 @@ local VirtualInputManager = game:GetService("VirtualInputManager")
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
--- Script-owned F presses stamp lastScriptFTime so the userHoldingF tracker below
--- can tell synthetic presses apart from a physical finger. Zero delay: stamping
--- happens inline, no waits added to any block/counter path.
+-- Script-owned F presses expect exactly one InputBegan/Ended echo each, so the
+-- userHoldingF tracker below can tell synthetic presses apart from a physical
+-- finger with no timing blind spots and no IsKeyDown polling. Zero delay:
+-- bookkeeping happens inline, no waits added to any block/counter path.
 local function scriptFDown()
-	lastScriptFTime = os.clock()
+	pendingDownEcho = pendingDownEcho + 1
+	lastDownStamp = os.clock()
 	pcall(function() VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game) end)
 end
 local function scriptFUp()
-	lastScriptFTime = os.clock()
+	pendingUpEcho = pendingUpEcho + 1
+	lastUpStamp = os.clock()
 	pcall(function() VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game) end)
 end
 table.insert(connections, UserInputService.InputBegan:Connect(function(input, _gp)
 	if input.KeyCode == Enum.KeyCode.F and input.UserInputType == Enum.UserInputType.Keyboard then
-		if os.clock() - lastScriptFTime < 0.05 then return end
+		if pendingDownEcho > 0 and os.clock() - lastDownStamp < ECHO_WINDOW then
+			pendingDownEcho = pendingDownEcho - 1
+			return
+		end
+		pendingDownEcho = 0
 		userHoldingF = true
 	end
 end))
 table.insert(connections, UserInputService.InputEnded:Connect(function(input)
 	if input.KeyCode == Enum.KeyCode.F and input.UserInputType == Enum.UserInputType.Keyboard then
-		if os.clock() - lastScriptFTime < 0.05 then
-			if not UserInputService:IsKeyDown(Enum.KeyCode.F) then userHoldingF = false end
+		if pendingUpEcho > 0 and os.clock() - lastUpStamp < ECHO_WINDOW then
+			pendingUpEcho = pendingUpEcho - 1
 			return
 		end
+		pendingUpEcho = 0
 		userHoldingF = false
 	end
 end))
@@ -2010,7 +2028,7 @@ local function pressInfinityKey()
 		-- swallowed while we're holding block, then fire 4 after the
 		-- block physics drops (mirrors AutoCounter's unblock-then-M1).
 		blockingState = false
-		VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
+		scriptFUp()
 		task.spawn(function()
 			task.wait(0.06)
 			VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Four, false, game)
@@ -3388,11 +3406,11 @@ testHoldBtn.MouseButton1Click:Connect(function()
 	if testHoldBlock then
 		testHoldBtn.Text = "Hold Block: ON"
 		testHoldBtn.BackgroundColor3 = Color3.fromRGB(80, 200, 80)
-		VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
+		scriptFDown()
 	else
 		testHoldBtn.Text = "Hold Block (Test)"
 		testHoldBtn.BackgroundColor3 = Color3.fromRGB(115, 95, 230)
-		VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
+		scriptFUp()
 	end
 end)
 
@@ -3408,9 +3426,7 @@ table.insert(connections, RunService.Heartbeat:Connect(function()
 	local char = LocalPlayer.Character
 	local hum = char and char:FindFirstChildOfClass("Humanoid")
 	if not char or not hum or hum.Health <= 0 then return end
-	pcall(function()
-		VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
-	end)
+	scriptFDown()
 end))
 
 
