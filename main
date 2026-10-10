@@ -39,6 +39,7 @@ local applyLockMode -- forward: master setter, assigned before the main-tab UI
 local refreshLockDropdown -- forward: assigned by the Lock dropdown; nil-safe to call
 local silentRotateOff = false -- forward: silent AutoRotate guard, owned by the facing helper
 local silentNoRotateObj = nil -- forward: our NoRotate marker, owned by the silent helpers
+local setFly -- forward: assigned in the Rage section, called by config load
 local counterKey = Enum.KeyCode.U
 local autoInfinityKey = Enum.KeyCode.K
 local toggleUIKey = Enum.KeyCode.RightAlt
@@ -53,6 +54,11 @@ local triggerbotKey = Enum.KeyCode.T
 local triggerbotSlot = 1
 local triggerbot2Key = Enum.KeyCode.Y
 local triggerbot2Slot = 2
+local flyEnabled = false
+local flyKey = nil -- unbound by default; set via the Rage keybind
+local flySpeed = 50
+local flyGyro = nil
+local flyVel = nil
 local triggerbot1Pending = false -- Move 1 key pressed: trying to fire slot 1
 local triggerbot2Pending = false -- Move 2 key pressed: trying to fire slot 2
 local triggerbot1RequestTime = 0
@@ -138,6 +144,7 @@ local lastBlockedAnims = {}
 local activeConnections = {}
 local autoCounterToggleObj = nil
 local triggerbotToggleObj = nil
+local flyToggleObj = nil
 local lastLocalM1Time = 0
 local seenUnknownAnimIds = {}
 local unloadScript = nil
@@ -341,8 +348,8 @@ screenGui.Parent = parentGui
 -- Main UI Frame (Stunning Dark/Neon Theme)
 local mainFrame = Instance.new("Frame")
 mainFrame.Name = "MainFrame"
-mainFrame.Size = UDim2.new(0, 280, 0, 480)
-mainFrame.Position = UDim2.new(0.5, -140, 0.5, -240)
+mainFrame.Size = UDim2.new(0, 470, 0, 500)
+mainFrame.Position = UDim2.new(0.5, -235, 0.5, -250)
 mainFrame.BackgroundColor3 = Color3.fromRGB(24, 24, 30)
 mainFrame.BorderSizePixel = 0
 mainFrame.Parent = screenGui
@@ -521,44 +528,77 @@ bodyFrame.Position = UDim2.new(0, 0, 0, 38)
 bodyFrame.BackgroundTransparency = 1
 bodyFrame.Parent = mainFrame
 
--- Tab Buttons Container
+-- Sidebar Tabs Container (vertical, left side)
 local tabsContainer = Instance.new("Frame")
-tabsContainer.Size = UDim2.new(1, -20, 0, 32)
+tabsContainer.Size = UDim2.new(0, 110, 1, -20)
 tabsContainer.Position = UDim2.new(0, 10, 0, 10)
-tabsContainer.BackgroundTransparency = 1
+tabsContainer.BackgroundColor3 = Color3.fromRGB(28, 28, 36)
+tabsContainer.BorderSizePixel = 0
 tabsContainer.Parent = bodyFrame
+local sideCorner = Instance.new("UICorner") sideCorner.CornerRadius = UDim.new(0, 8) sideCorner.Parent = tabsContainer
 
-local function makeTabBtn(name, xPos)
+local sideHeader = Instance.new("TextLabel")
+sideHeader.Size = UDim2.new(1, 0, 0, 22)
+sideHeader.BackgroundTransparency = 1
+sideHeader.Text = "MENU"
+sideHeader.TextColor3 = Color3.fromRGB(120, 120, 135)
+sideHeader.TextSize = 11
+sideHeader.Font = Enum.Font.GothamBold
+sideHeader.Parent = tabsContainer
+
+local sideLayout = Instance.new("UIListLayout")
+sideLayout.FillDirection = Enum.FillDirection.Vertical
+sideLayout.SortOrder = Enum.SortOrder.LayoutOrder
+sideLayout.Padding = UDim.new(0, 6)
+sideLayout.VerticalAlignment = Enum.VerticalAlignment.Top
+sideLayout.Parent = tabsContainer
+local sidePadding = Instance.new("UIPadding")
+sidePadding.PaddingTop = UDim.new(0, 28)
+sidePadding.PaddingLeft = UDim.new(0, 6)
+sidePadding.PaddingRight = UDim.new(0, 6)
+sidePadding.Parent = tabsContainer
+
+local function makeTabBtn(name, order, isFirst)
 	local btn = Instance.new("TextButton")
-	btn.Size = UDim2.new(0.2, -2, 1, 0)
-	btn.Position = UDim2.new(xPos, (xPos > 0) and (xPos * 10) or 0, 0, 0)
-	btn.BackgroundColor3 = (xPos == 0) and Color3.fromRGB(255, 105, 180) or Color3.fromRGB(35, 35, 45)
+	btn.Size = UDim2.new(1, 0, 0, 40)
+	btn.BackgroundColor3 = isFirst and Color3.fromRGB(255, 105, 180) or Color3.fromRGB(35, 35, 45)
 	btn.Text = name
-	btn.TextColor3 = (xPos == 0) and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(150, 150, 170)
+	btn.TextColor3 = isFirst and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(150, 150, 170)
 	btn.Font = Enum.Font.GothamBold
-	btn.TextSize = 13
+	btn.TextSize = 14
+	btn.LayoutOrder = order
+	btn.AutoButtonColor = false
 	btn.Parent = tabsContainer
 	local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 6); c.Parent = btn
 	return btn
 end
 
-local mainTabBtn = makeTabBtn("Lock", 0)
-local espTabBtn = makeTabBtn("ESP", 0.2)
-local miscTabBtn = makeTabBtn("Misc", 0.4)
-local configTabBtn = makeTabBtn("Config", 0.6)
-local skinTabBtn = makeTabBtn("Skin", 0.8)
+local mainTabBtn = makeTabBtn("Lock", 1, true)
+local espTabBtn = makeTabBtn("ESP", 2, false)
+local miscTabBtn = makeTabBtn("Misc", 3, false)
+local rageTabBtn = makeTabBtn("Rage", 4, false)
+local configTabBtn = makeTabBtn("Config", 5, false)
+local skinTabBtn = makeTabBtn("Skin", 6, false)
 
--- Tab Container Frames
+-- Divider between sidebar and content
+local divider = Instance.new("Frame")
+divider.Size = UDim2.new(0, 1, 1, -20)
+divider.Position = UDim2.new(0, 128, 0, 10)
+divider.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+divider.BorderSizePixel = 0
+divider.Parent = bodyFrame
+
+-- Tab Container Frames (content area, right of sidebar)
 local mainTabFrame = Instance.new("Frame")
-mainTabFrame.Size = UDim2.new(1, -20, 1, -52)
-mainTabFrame.Position = UDim2.new(0, 10, 0, 52)
+mainTabFrame.Size = UDim2.new(1, -150, 1, -20)
+mainTabFrame.Position = UDim2.new(0, 140, 0, 10)
 mainTabFrame.BackgroundTransparency = 1
 mainTabFrame.Visible = true
 mainTabFrame.Parent = bodyFrame
 
 local espTabFrame = Instance.new("ScrollingFrame")
-espTabFrame.Size = UDim2.new(1, -20, 1, -52)
-espTabFrame.Position = UDim2.new(0, 10, 0, 52)
+espTabFrame.Size = UDim2.new(1, -150, 1, -20)
+espTabFrame.Position = UDim2.new(0, 140, 0, 10)
 espTabFrame.BackgroundTransparency = 1
 espTabFrame.Visible = false
 espTabFrame.Parent = bodyFrame
@@ -572,8 +612,8 @@ espPadding.PaddingRight = UDim.new(0, 10)
 espPadding.Parent = espTabFrame
 
 local miscTabFrame = Instance.new("ScrollingFrame")
-miscTabFrame.Size = UDim2.new(1, -20, 1, -52)
-miscTabFrame.Position = UDim2.new(0, 10, 0, 52)
+miscTabFrame.Size = UDim2.new(1, -150, 1, -20)
+miscTabFrame.Position = UDim2.new(0, 140, 0, 10)
 miscTabFrame.BackgroundTransparency = 1
 miscTabFrame.Visible = false
 miscTabFrame.Parent = bodyFrame
@@ -587,15 +627,22 @@ miscPadding.PaddingRight = UDim.new(0, 10)
 miscPadding.Parent = miscTabFrame
 
 local configTabFrame = Instance.new("Frame")
-configTabFrame.Size = UDim2.new(1, -20, 1, -52)
-configTabFrame.Position = UDim2.new(0, 10, 0, 52)
+configTabFrame.Size = UDim2.new(1, -150, 1, -20)
+configTabFrame.Position = UDim2.new(0, 140, 0, 10)
 configTabFrame.BackgroundTransparency = 1
 configTabFrame.Visible = false
 configTabFrame.Parent = bodyFrame
 
+local rageTabFrame = Instance.new("Frame")
+rageTabFrame.Size = UDim2.new(1, -150, 1, -20)
+rageTabFrame.Position = UDim2.new(0, 140, 0, 10)
+rageTabFrame.BackgroundTransparency = 1
+rageTabFrame.Visible = false
+rageTabFrame.Parent = bodyFrame
+
 local skinTabFrame = Instance.new("ScrollingFrame")
-skinTabFrame.Size = UDim2.new(1, -20, 1, -52)
-skinTabFrame.Position = UDim2.new(0, 10, 0, 52)
+skinTabFrame.Size = UDim2.new(1, -150, 1, -20)
+skinTabFrame.Position = UDim2.new(0, 140, 0, 10)
 skinTabFrame.BackgroundTransparency = 1
 skinTabFrame.Visible = false
 skinTabFrame.Parent = bodyFrame
@@ -1324,6 +1371,29 @@ buildSkinTab()
 local targetEspSensitivity = 0.25
 local targetEspRange = 180
 local recentM1Time = os.clock()
+-- Fly / HeadAttach state (lives here, not top-level: the main chunk is at
+-- the 200-register limit). All users are below in this IIFE.
+local flySwingTime = 0 -- last own-M1-swing timestamp (fly slows while fresh)
+local headAttachEnabled = false
+local headAttachKey = nil -- unbound by default; hold via the Rage keybind
+local headAttachOffset = 0 -- studs beyond the target from your side (0 = directly above head)
+local headAttachHolding = false
+local headAttachFlying = false
+local headAttachCurrent = nil
+local headAttachToggleObj = nil
+local headAttachOffsetDir = nil -- latched hover direction (camera-anchored, survives degenerate frames)
+-- HeadAttach tuning (ported from headride.luau)
+local HEAD_ATTACH_ABOVE = 3.2
+local HEAD_ATTACH_CHASE = 0.35
+local HEAD_ATTACH_STICK_DIST = 6
+local HEAD_ATTACH_STICK = 0.2
+local HEAD_ATTACH_DEADZONE = 0.8
+local HEAD_ATTACH_BOB = 0.22
+local HEAD_ATTACH_BOB_SPEED = 2.1
+local HEAD_ATTACH_SWAY = 0.8
+local HEAD_ATTACH_SWAY_SPEED = 1.4
+local HEAD_ATTACH_SWITCH_MARGIN = 0.6
+local HEAD_ATTACH_MAX_RANGE = 16
 
 -- ====================== CONFIG MANAGER ======================
 local HttpService = game:GetService("HttpService")
@@ -1354,6 +1424,12 @@ function ConfigManager.collectSettings()
 		smoothness = smoothness,
 		lockKey = lockKey.Name,
 		lockMode = lockMode,
+		flyEnabled = flyEnabled,
+		flyKey = flyKey and flyKey.Name or nil,
+		flySpeed = flySpeed,
+		headAttachEnabled = headAttachEnabled,
+		headAttachKey = headAttachKey and headAttachKey.Name or nil,
+		headAttachOffset = headAttachOffset,
 		moveEspEnabled = moveEspEnabled,
 		ultEspEnabled = ultEspEnabled,
 		arrowsEnabled = arrowsEnabled,
@@ -1433,6 +1509,13 @@ function ConfigManager.load(name)
 		end
 		applyLockMode(mode)
 	end
+	flyEnabled = data.flyEnabled or false
+	if data.flyKey then flyKey = Enum.KeyCode[data.flyKey] or nil end
+	flySpeed = data.flySpeed or 50
+	if flyEnabled then pcall(setFly, true) end
+	headAttachEnabled = data.headAttachEnabled or false
+	if data.headAttachKey then headAttachKey = Enum.KeyCode[data.headAttachKey] or nil end
+	headAttachOffset = tonumber(data.headAttachOffset) or 0
 	moveEspEnabled = data.moveEspEnabled or false
 	ultEspEnabled = data.ultEspEnabled or false
 			arrowsEnabled = data.arrowsEnabled or false
@@ -1503,6 +1586,12 @@ function ConfigManager.load(name)
 	if settingsRefs.smoothness then settingsRefs.smoothness.Set(smoothness) end
 	if settingsRefs.lockKey then settingsRefs.lockKey.Set(lockKey) end
 	if settingsRefs.lockMode then settingsRefs.lockMode.Set(lockMode) end
+	if settingsRefs.flyEnabled then settingsRefs.flyEnabled.Set(flyEnabled) end
+	if settingsRefs.flyKey then settingsRefs.flyKey.Set(flyKey) end
+	if settingsRefs.flySpeed then settingsRefs.flySpeed.Set(flySpeed) end
+	if settingsRefs.headAttachEnabled then settingsRefs.headAttachEnabled.Set(headAttachEnabled) end
+	if settingsRefs.headAttachKey then settingsRefs.headAttachKey.Set(headAttachKey) end
+	if settingsRefs.headAttachOffset then settingsRefs.headAttachOffset.Set(headAttachOffset) end
 	if settingsRefs.moveEspEnabled then settingsRefs.moveEspEnabled.Set(moveEspEnabled) end
 	if settingsRefs.ultEspEnabled then settingsRefs.ultEspEnabled.Set(ultEspEnabled) end
 			if settingsRefs.arrowsEnabled then settingsRefs.arrowsEnabled.Set(arrowsEnabled) end
@@ -1725,7 +1814,7 @@ local function createKeybind(parent, text, yPos, defaultKey, callback)
     frame.Parent = parent
 
     local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(1, -80, 1, 0)
+    label.Size = UDim2.new(1, -142, 1, 0)
     label.BackgroundTransparency = 1
     label.Text = text
     label.TextColor3 = Color3.fromRGB(245, 245, 250)
@@ -1738,7 +1827,7 @@ local function createKeybind(parent, text, yPos, defaultKey, callback)
     bindBtn.Size = UDim2.new(0, 72, 0, 24)
     bindBtn.Position = UDim2.new(1, -72, 0.5, -12)
     bindBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
-    bindBtn.Text = defaultKey.Name
+    bindBtn.Text = (defaultKey and defaultKey.Name) or "None"
     bindBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
     bindBtn.Font = Enum.Font.GothamBold
     bindBtn.TextSize = 11
@@ -1746,12 +1835,29 @@ local function createKeybind(parent, text, yPos, defaultKey, callback)
     local btnCorner = Instance.new("UICorner") btnCorner.CornerRadius = UDim.new(0, 6) btnCorner.Parent = bindBtn
     local btnStroke = Instance.new("UIStroke") btnStroke.Color = Color3.fromRGB(60, 60, 75) btnStroke.Thickness = 1 btnStroke.Parent = bindBtn
 
+    local unbindBtn = Instance.new("TextButton")
+    unbindBtn.Size = UDim2.new(0, 58, 0, 24)
+    unbindBtn.Position = UDim2.new(1, -136, 0.5, -12)
+    unbindBtn.BackgroundColor3 = Color3.fromRGB(65, 28, 28)
+    unbindBtn.Text = "Unbind"
+    unbindBtn.TextColor3 = Color3.fromRGB(220, 130, 130)
+    unbindBtn.Font = Enum.Font.GothamBold
+    unbindBtn.TextSize = 10
+    unbindBtn.Parent = frame
+    local unbindCorner = Instance.new("UICorner") unbindCorner.CornerRadius = UDim.new(0, 6) unbindCorner.Parent = unbindBtn
+
     local binding = false
     local result = {
         Set = function(key)
-            bindBtn.Text = key.Name
+            bindBtn.Text = (key and key.Name) or "None"
         end
     }
+    unbindBtn.MouseButton1Click:Connect(function()
+        if binding then return end
+        result.Set(nil)
+        callback(nil)
+        autoSaveSettings()
+    end)
     bindBtn.MouseButton1Click:Connect(function()
         if binding then return end
         binding = true
@@ -1902,6 +2008,263 @@ end)
 settingsRefs.lockKey = createKeybind(mainTabFrame, "Lock Keybind", 238, lockKey, function(key)
     lockKey = key
 end)
+
+-- RAGE TAB (Fly)
+local function cleanupFlyMovers()
+	if flyGyro then pcall(function() flyGyro:Destroy() end) flyGyro = nil end
+	if flyVel then pcall(function() flyVel:Destroy() end) flyVel = nil end
+end
+
+setFly = function(on)
+	flyEnabled = on
+	if not on then cleanupFlyMovers() return end
+	local char = LocalPlayer.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return end
+	cleanupFlyMovers()
+	flyGyro = Instance.new("BodyGyro")
+	flyGyro.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
+	flyGyro.P = 1000
+	flyGyro.CFrame = hrp.CFrame
+	flyGyro.Parent = hrp
+	flyVel = Instance.new("BodyVelocity")
+	flyVel.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+	flyVel.Velocity = Vector3.zero
+	flyVel.Parent = hrp
+end
+
+flyToggleObj = createToggle(rageTabFrame, "Fly", 10, flyEnabled, function(state)
+    setFly(state)
+end)
+settingsRefs.flyEnabled = flyToggleObj
+
+settingsRefs.flyKey = createKeybind(rageTabFrame, "Fly Keybind", 48, flyKey, function(key)
+    flyKey = key
+end)
+
+settingsRefs.flySpeed = createSlider(rageTabFrame, "Fly Speed", 86, 10, 200, flySpeed, function(val)
+    flySpeed = val
+end, function(text, val)
+    return text .. ": " .. string.format("%.0f", val)
+end)
+
+table.insert(connections, RunService.Heartbeat:Connect(function()
+	if not flyEnabled then return end
+	if headAttachFlying then return end -- HeadAttach owns the root while sticking
+	local char = LocalPlayer.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not hrp or not hum or hum.Health <= 0 then return end
+	if not flyGyro or not flyVel or not flyGyro.Parent or not flyVel.Parent then
+		setFly(true)
+		if not flyGyro or not flyVel then return end
+	end
+	local cam = Camera.CFrame
+	local move = Vector3.zero
+	if UserInputService:IsKeyDown(Enum.KeyCode.W) then move = move + cam.LookVector end
+	if UserInputService:IsKeyDown(Enum.KeyCode.S) then move = move - cam.LookVector end
+	if UserInputService:IsKeyDown(Enum.KeyCode.D) then move = move + cam.RightVector end
+	if UserInputService:IsKeyDown(Enum.KeyCode.A) then move = move - cam.RightVector end
+	if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then move = move - Vector3.yAxis end
+	local now = os.clock()
+	-- Hit-slow: while our own M1 swing is fresh, cap speed so you don't
+	-- overshoot the person you're hitting (flySwingTime is stamped by the
+	-- swing hook in the Auto Block section, next to sharedM1AnimIds).
+	local speed = flySpeed
+	if now - flySwingTime < 0.3 then speed = 12 end
+	if move.Magnitude > 0.01 then move = move.Unit * speed end
+	flyVel.Velocity = move
+	flyGyro.CFrame = cam
+end))
+
+table.insert(connections, LocalPlayer.CharacterAdded:Connect(function()
+	task.wait(0.5)
+	if flyEnabled then setFly(true) end
+end))
+
+-- RAGE TAB (Head Attach, ported from headride.luau: hold key to stick above whoever you're looking at)
+headAttachToggleObj = createToggle(rageTabFrame, "Head Attach", 140, headAttachEnabled, function(state)
+    headAttachEnabled = state
+    if not state then
+        headAttachHolding = false
+        headAttachCurrent = nil
+        headAttachOffsetDir = nil
+        if headAttachFlying then
+            headAttachFlying = false
+            pcall(function()
+                local c = LocalPlayer.Character
+                local h = c and c:FindFirstChildOfClass("Humanoid")
+                if h then h.PlatformStand = false end
+            end)
+        end
+    end
+end)
+settingsRefs.headAttachEnabled = headAttachToggleObj
+
+settingsRefs.headAttachKey = createKeybind(rageTabFrame, "Head Attach Keybind", 178, headAttachKey, function(key)
+    headAttachKey = key
+end)
+
+settingsRefs.headAttachOffset = createSlider(rageTabFrame, "Head Attach Offset", 216, 0, 12, headAttachOffset, function(val)
+    headAttachOffset = val
+end, function(text, val)
+    return text .. ": " .. string.format("%.0f", val)
+end)
+
+local function headAttachRoot()
+    local c = LocalPlayer.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function headAttachHum()
+    local c = LocalPlayer.Character
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
+
+local function headAttachValid(head, myRoot)
+    if not head or not head.Parent then return false end
+    local m = head.Parent
+    local h = m and m:FindFirstChildOfClass("Humanoid")
+    if not h or h.Health <= 0 then return false end
+    if (head.Position - myRoot.Position).Magnitude > HEAD_ATTACH_MAX_RANGE then return false end
+    return true
+end
+
+local function headAttachScoreOf(head, camPos, lookVec, myRoot)
+    local to = head.Position - camPos
+    if to.Magnitude <= 0 then return math.huge end
+    return (lookVec - to.Unit).Magnitude + ((head.Position - myRoot.Position).Magnitude / HEAD_ATTACH_MAX_RANGE)
+end
+
+local function headAttachIsTarget(m)
+    if m == LocalPlayer.Character then return false end -- never yourself
+    if m.Name:find("Dummy") then return true end
+    return Players:GetPlayerFromCharacter(m) ~= nil -- any live player, same rules
+end
+
+local function headAttachGoal()
+    local live = workspace:FindFirstChild("Live")
+    local mr = headAttachRoot()
+    local cam = Camera
+    if not live or not mr or not cam then headAttachCurrent = nil return nil end
+    local camPos = cam.CFrame.Position
+    local look = cam.CFrame.LookVector
+    if headAttachValid(headAttachCurrent, mr) then
+        local curScore = headAttachScoreOf(headAttachCurrent, camPos, look, mr)
+        local best, bestScore = nil, math.huge
+        for _, m in ipairs(live:GetChildren()) do
+            if headAttachIsTarget(m) then
+                local head = m:FindFirstChild("Head") or m:FindFirstChild("HumanoidRootPart")
+                if head ~= headAttachCurrent and headAttachValid(head, mr) then
+                    local s = headAttachScoreOf(head, camPos, look, mr)
+                    if s < bestScore then best, bestScore = head, s end
+                end
+            end
+        end
+        -- only steal focus if clearly better (kills frame-to-frame flicker)
+        if best and bestScore < curScore * HEAD_ATTACH_SWITCH_MARGIN then headAttachCurrent = best end
+        return headAttachCurrent
+    end
+    local best, bestScore = nil, math.huge
+    for _, m in ipairs(live:GetChildren()) do
+        if headAttachIsTarget(m) then
+            local h = m:FindFirstChildOfClass("Humanoid")
+            local head = m:FindFirstChild("Head") or m:FindFirstChild("HumanoidRootPart")
+            if h and h.Health > 0 and head then
+                local myDist = (head.Position - mr.Position).Magnitude
+                -- range limit is measured from YOU to the target
+                if myDist > HEAD_ATTACH_MAX_RANGE then continue end
+                local to = head.Position - camPos
+                local dist = to.Magnitude
+                if dist > 0 then
+                    -- blend: camera-centering + closeness to you (both matter)
+                    local score = (look - to.Unit).Magnitude + (myDist / HEAD_ATTACH_MAX_RANGE)
+                    if score < bestScore then best, bestScore = head, score end
+                end
+            end
+        end
+    end
+    headAttachCurrent = best
+    return best
+end
+
+table.insert(connections, RunService.Heartbeat:Connect(function()
+    local hrp, h = headAttachRoot(), headAttachHum()
+    if not hrp or not h then return end
+    if headAttachEnabled and headAttachHolding and headAttachKey then
+        local head = headAttachGoal()
+        if not head then
+            -- nothing in range/sight: stay fully normal, never freeze mid-air
+            if headAttachFlying then headAttachFlying = false h.PlatformStand = false end
+            return
+        end
+        if not headAttachFlying then headAttachFlying = true h.PlatformStand = true end
+        local base = head.Position + Vector3.new(0, HEAD_ATTACH_ABOVE, 0)
+        if headAttachOffset > 0.01 then
+            -- Offset to the far side of the target along the direction WE are
+            -- looking (camera-anchored). The old position-anchored version
+            -- (us-to-target vector) flipped the goal to the opposite side
+            -- every time we crossed over the head, causing the back-and-forth
+            -- teleporting. Camera direction has no such feedback loop.
+            -- Latched: looking straight down degenerates the flattened vector,
+            -- so keep the last good direction instead of jumping.
+            local camLook = Camera and Camera.CFrame.LookVector or nil
+            local dir = camLook and Vector3.new(camLook.X, 0, camLook.Z) or nil
+            if dir and dir.Magnitude > 0.2 then
+                headAttachOffsetDir = dir.Unit
+            else
+                local away = head.Position - hrp.Position
+                away = Vector3.new(away.X, 0, away.Z)
+                if away.Magnitude > 0.5 then
+                    headAttachOffsetDir = away.Unit
+                end
+            end
+            if headAttachOffsetDir then
+                base = base + headAttachOffsetDir * headAttachOffset
+            end
+        else
+            headAttachOffsetDir = nil
+        end
+        local d = (base - hrp.Position).Magnitude
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+        -- organic layer: breathe vertically always, arc sideways while traveling.
+        -- both fade with closeness so the final sit-down is still exact.
+        local t = os.clock()
+        local closeK = math.clamp(d / HEAD_ATTACH_STICK_DIST, 0, 1)
+        local bob = math.sin(t * HEAD_ATTACH_BOB_SPEED) * HEAD_ATTACH_BOB * (0.4 + 0.6 * (1 - closeK))
+        local camR = Camera and Camera.CFrame.RightVector or Vector3.xAxis
+        local sway = math.sin(t * HEAD_ATTACH_SWAY_SPEED) * HEAD_ATTACH_SWAY * closeK
+        local goal = base + Vector3.new(0, bob, 0) + camR * sway
+        if d < HEAD_ATTACH_DEADZONE then goal = base + Vector3.new(0, bob * 0.5, 0) end
+        local a = d < HEAD_ATTACH_STICK_DIST and HEAD_ATTACH_STICK or HEAD_ATTACH_CHASE
+        hrp.CFrame = hrp.CFrame:Lerp(CFrame.new(goal, goal + hrp.CFrame.LookVector), a)
+    elseif headAttachFlying then
+        headAttachFlying = false
+        h.PlatformStand = false
+    end
+end))
+
+table.insert(connections, UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if UserInputService:GetFocusedTextBox() then return end
+    if headAttachEnabled and headAttachKey and input.KeyCode == headAttachKey then
+        headAttachHolding = true
+    end
+end))
+
+table.insert(connections, UserInputService.InputEnded:Connect(function(input)
+    if headAttachKey and input.KeyCode == headAttachKey then
+        headAttachHolding = false
+    end
+end))
+
+table.insert(connections, LocalPlayer.CharacterAdded:Connect(function()
+    headAttachHolding = false
+    headAttachFlying = false
+    headAttachCurrent = nil
+    headAttachOffsetDir = nil
+end))
 
 -- ESP TAB (Move ESP, Ult ESP, Offscreen arrows, Move inputs)
 settingsRefs.moveEspEnabled = createToggle(espTabFrame, "Move ESP", 10, moveEspEnabled, function(state)
@@ -3610,7 +3973,7 @@ local creditsLabel = Instance.new("TextLabel")
 creditsLabel.Size = UDim2.new(1, 0, 0, 20)
 creditsLabel.Position = UDim2.new(0, 0, 0, 1420)
 creditsLabel.BackgroundTransparency = 1
-creditsLabel.Text = "Credits: @ace_rsss"
+creditsLabel.Text = "Credits: @ace_rsss & kyoka"
 creditsLabel.TextColor3 = Color3.fromRGB(120, 120, 120)
 creditsLabel.TextSize = 14
 creditsLabel.Font = Enum.Font.Gotham
@@ -3622,6 +3985,7 @@ local function setTab(tabName)
 	mainTabFrame.Visible = (tabName == "Lock")
 	espTabFrame.Visible = (tabName == "ESP")
 	miscTabFrame.Visible = (tabName == "Misc")
+	rageTabFrame.Visible = (tabName == "Rage")
 	configTabFrame.Visible = (tabName == "Config")
 	skinTabFrame.Visible = (tabName == "Skin")
 	
@@ -3640,6 +4004,11 @@ local function setTab(tabName)
 		TextColor3 = (tabName == "Misc") and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(150, 150, 170)
 	}):Play()
 	
+	TweenService:Create(rageTabBtn, TweenInfo.new(0.18), {
+		BackgroundColor3 = (tabName == "Rage") and Color3.fromRGB(255, 105, 180) or Color3.fromRGB(35, 35, 45),
+		TextColor3 = (tabName == "Rage") and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(150, 150, 170)
+	}):Play()
+	
 	TweenService:Create(configTabBtn, TweenInfo.new(0.18), {
 		BackgroundColor3 = (tabName == "Config") and Color3.fromRGB(255, 105, 180) or Color3.fromRGB(35, 35, 45),
 		TextColor3 = (tabName == "Config") and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(150, 150, 170)
@@ -3654,6 +4023,7 @@ end
 mainTabBtn.MouseButton1Click:Connect(function() setTab("Lock") end)
 espTabBtn.MouseButton1Click:Connect(function() setTab("ESP") end)
 miscTabBtn.MouseButton1Click:Connect(function() setTab("Misc") end)
+rageTabBtn.MouseButton1Click:Connect(function() setTab("Rage") end)
 configTabBtn.MouseButton1Click:Connect(function() setTab("Config") end)
 skinTabBtn.MouseButton1Click:Connect(function() setTab("Skin") end)
 
@@ -3727,6 +4097,17 @@ unloadScript = function()
 	autoPlayEnabled = false
 	autoSprintEnabled = false
 	triggerbotEnabled = false
+	flyEnabled = false
+	cleanupFlyMovers()
+	headAttachEnabled = false
+	headAttachHolding = false
+	headAttachFlying = false
+	headAttachCurrent = nil
+	pcall(function()
+		local c = LocalPlayer.Character
+		local h = c and c:FindFirstChildOfClass("Humanoid")
+		if h then h.PlatformStand = false end
+	end)
 	triggerbot1Pending = false
 	triggerbot2Pending = false
 	triggerbotMarkPlayer = nil
@@ -4383,6 +4764,32 @@ local sharedM1AnimIds = {
 	["14272266117"] = true, ["14272296104"] = true,
 	["1470472673"] = true,
 }
+
+-- Fly hit-slow hook: stamp flySwingTime whenever WE start an M1 swing
+-- (verified live: swing anim plays, impact lands ~0.35s later, Super Dummy
+-- loses ~4.2 HP per hit). The Fly heartbeat caps speed to 8 while fresh.
+-- ID match (not track-name match): real M1 tracks are generically named
+-- "Animation" (e.g. rbxassetid://1470439852).
+local flySwingConn = nil
+local function hookFlySwing(char)
+	if flySwingConn then pcall(function() flySwingConn:Disconnect() end) flySwingConn = nil end
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local anim = hum and hum:FindFirstChildOfClass("Animator")
+	if not anim then return end
+	flySwingConn = anim.AnimationPlayed:Connect(function(track)
+		local aid = track.Animation and track.Animation.AnimationId
+		local num = aid and (tostring(aid):match("%d+")) or ""
+		if num ~= "" and sharedM1AnimIds[num] then
+			flySwingTime = os.clock()
+		end
+	end)
+	table.insert(connections, flySwingConn)
+end
+if LocalPlayer.Character then hookFlySwing(LocalPlayer.Character) end
+table.insert(connections, LocalPlayer.CharacterAdded:Connect(function(char)
+	task.wait(0.5)
+	hookFlySwing(char)
+end))
 
 -- Stand/summon M1 lookup (Jotaro-style): M1 anim plays on Workspace.Stands.<username>, not the character.
 -- Covers all stand characters sharing the Stands/<username> convention. Direct lookup keeps attribution
@@ -5054,6 +5461,13 @@ table.insert(connections, UserInputService.InputBegan:Connect(function(input, gp
 		end
 	end
 
+	-- Toggle fly keybind (unbound by default)
+	if flyKey and input.KeyCode == flyKey then
+		setFly(not flyEnabled)
+		if flyToggleObj then flyToggleObj.Set(flyEnabled) end
+		autoSaveSettings()
+	end
+
 	-- Toggle Piggy Hub UI visibility (mainFrame only, keep Counter/Infinity labels)
 	if input.KeyCode == toggleUIKey then
 		uiVisible = not uiVisible
@@ -5097,7 +5511,7 @@ end))
 table.insert(connections, minimizeButton.MouseButton1Click:Connect(function()
 	minimized = not minimized
 	bodyFrame.Visible = not minimized
-	mainFrame.Size = minimized and UDim2.new(0, 280, 0, 38) or UDim2.new(0, 280, 0, 420)
+	mainFrame.Size = minimized and UDim2.new(0, 470, 0, 38) or UDim2.new(0, 470, 0, 500)
 end))
 
 -- Silent facing helper: yaw-faces our character toward targetPos. Shared by the
