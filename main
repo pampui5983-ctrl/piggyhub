@@ -5981,6 +5981,9 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 			pcall(function() startOffset = track.TimePosition or 0 end)
 		end
 		if type(startOffset) ~= "number" or startOffset < 0 then startOffset = 0 end
+		-- Clamp backdate: only compensate small gate lag (frame + 0.03 throttle).
+		-- Fresh sees (toggle-on / walk-into-range mid-swing) get ~full delay from now, no instant fire.
+		startOffset = math.min(startOffset, 0.08)
 		-- Track only: no F press while tracking, so a physical hold is
 		-- never disturbed until the fire instant (see fire rules above).
 		airSwingArmed = {
