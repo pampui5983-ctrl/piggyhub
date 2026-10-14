@@ -354,8 +354,12 @@ mainFrame.BackgroundColor3 = Color3.fromRGB(24, 24, 30)
 mainFrame.BorderSizePixel = 0
 mainFrame.Parent = screenGui
 
-local corner = Instance.new("UICorner") corner.CornerRadius = UDim.new(0, 12) corner.Parent = mainFrame
-local stroke = Instance.new("UIStroke") stroke.Color = Color3.fromRGB(255, 105, 180) stroke.Thickness = 2 stroke.Parent = mainFrame
+do
+    local corner = Instance.new("UICorner") corner.CornerRadius = UDim.new(0, 12) corner.Parent = mainFrame
+end
+do
+    local stroke = Instance.new("UIStroke") stroke.Color = Color3.fromRGB(255, 105, 180) stroke.Thickness = 2 stroke.Parent = mainFrame
+end
 
 -- Counter Status Label (right side, draggable)
 local counterLabel = Instance.new("TextLabel")
@@ -372,7 +376,9 @@ counterLabel.TextSize = 15
 counterLabel.Font = Enum.Font.GothamBold
 counterLabel.TextXAlignment = Enum.TextXAlignment.Center
 counterLabel.Parent = screenGui
-local labelCorner = Instance.new("UICorner") labelCorner.CornerRadius = UDim.new(0, 6) labelCorner.Parent = counterLabel
+do
+    local labelCorner = Instance.new("UICorner") labelCorner.CornerRadius = UDim.new(0, 6) labelCorner.Parent = counterLabel
+end
 
 local labelDrag, labelDragStart, labelStartPos
 table.insert(connections, counterLabel.InputBegan:Connect(function(input)
@@ -418,7 +424,9 @@ infinityLabel.TextSize = 15
 infinityLabel.Font = Enum.Font.GothamBold
 infinityLabel.TextXAlignment = Enum.TextXAlignment.Center
 infinityLabel.Parent = screenGui
-local infinityLabelCorner = Instance.new("UICorner") infinityLabelCorner.CornerRadius = UDim.new(0, 6) infinityLabelCorner.Parent = infinityLabel
+do
+    local infinityLabelCorner = Instance.new("UICorner") infinityLabelCorner.CornerRadius = UDim.new(0, 6) infinityLabelCorner.Parent = infinityLabel
+end
 
 local infLabelDrag, infLabelDragStart, infLabelStartPos
 table.insert(connections, infinityLabel.InputBegan:Connect(function(input)
@@ -460,18 +468,20 @@ lockIndicator.AlwaysOnTop = true
 lockIndicator.Enabled = false
 lockIndicator.Parent = screenGui
 
-local lockRing = Instance.new("Frame")
-lockRing.Name = "Ring"
-lockRing.Size = UDim2.new(1, 0, 1, 0)
-lockRing.BackgroundTransparency = 1
-lockRing.Parent = lockIndicator
-local lockRingCorner = Instance.new("UICorner")
-lockRingCorner.CornerRadius = UDim.new(1, 0)
-lockRingCorner.Parent = lockRing
-local lockRingStroke = Instance.new("UIStroke")
-lockRingStroke.Color = Color3.fromRGB(255, 50, 50)
-lockRingStroke.Thickness = 2
-lockRingStroke.Parent = lockRing
+do
+    local lockRing = Instance.new("Frame")
+    lockRing.Name = "Ring"
+    lockRing.Size = UDim2.new(1, 0, 1, 0)
+    lockRing.BackgroundTransparency = 1
+    lockRing.Parent = lockIndicator
+    local lockRingCorner = Instance.new("UICorner")
+    lockRingCorner.CornerRadius = UDim.new(1, 0)
+    lockRingCorner.Parent = lockRing
+    local lockRingStroke = Instance.new("UIStroke")
+    lockRingStroke.Color = Color3.fromRGB(255, 50, 50)
+    lockRingStroke.Thickness = 2
+    lockRingStroke.Parent = lockRing
+end
 
 local function getLockTorso()
 	local char = lockedTarget and lockedTarget.Parent
@@ -499,27 +509,35 @@ titleBar.BackgroundColor3 = Color3.fromRGB(32, 32, 40)
 titleBar.BorderSizePixel = 0
 titleBar.Parent = mainFrame
 
-local titleCorner = Instance.new("UICorner") titleCorner.CornerRadius = UDim.new(0, 12) titleCorner.Parent = titleBar
+do
+    local titleCorner = Instance.new("UICorner") titleCorner.CornerRadius = UDim.new(0, 12) titleCorner.Parent = titleBar
+end
 
 -- Flatten the bottom corners of the title bar
-local titleFlat = Instance.new("Frame")
-titleFlat.Size = UDim2.new(1, 0, 0, 12)
-titleFlat.Position = UDim2.new(0, 0, 1, -12)
-titleFlat.BackgroundColor3 = Color3.fromRGB(32, 32, 40)
-titleFlat.BorderSizePixel = 0
-titleFlat.Parent = titleBar
+do
+    local titleFlat = Instance.new("Frame")
+    titleFlat.Size = UDim2.new(1, 0, 0, 12)
+    titleFlat.Position = UDim2.new(0, 0, 1, -12)
+    titleFlat.BackgroundColor3 = Color3.fromRGB(32, 32, 40)
+    titleFlat.BorderSizePixel = 0
+    titleFlat.Parent = titleBar
+end
 
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -40, 1, 0) title.Position = UDim2.new(0, 12, 0, 0)
-title.BackgroundTransparency = 1 title.Text = "🐷 Piggy Hub" title.TextColor3 = Color3.fromRGB(255, 105, 180)
-title.TextSize = 18 title.Font = Enum.Font.GothamBold title.TextXAlignment = Enum.TextXAlignment.Left title.Parent = titleBar
+do
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -40, 1, 0) title.Position = UDim2.new(0, 12, 0, 0)
+    title.BackgroundTransparency = 1 title.Text = "🐷 Piggy Hub" title.TextColor3 = Color3.fromRGB(255, 105, 180)
+    title.TextSize = 18 title.Font = Enum.Font.GothamBold title.TextXAlignment = Enum.TextXAlignment.Left title.Parent = titleBar
+end
 
 local minimizeButton = Instance.new("TextButton")
 minimizeButton.Size = UDim2.new(0, 24, 0, 24) minimizeButton.Position = UDim2.new(1, -30, 0.5, -12)
 minimizeButton.BackgroundColor3 = Color3.fromRGB(45, 45, 55) minimizeButton.Text = "🐽"
 minimizeButton.TextSize = 16 minimizeButton.TextColor3 = Color3.fromRGB(255, 255, 255)
 minimizeButton.Font = Enum.Font.GothamBold minimizeButton.Parent = titleBar
-local minCorner = Instance.new("UICorner") minCorner.CornerRadius = UDim.new(0, 6) minCorner.Parent = minimizeButton
+do
+    local minCorner = Instance.new("UICorner") minCorner.CornerRadius = UDim.new(0, 6) minCorner.Parent = minimizeButton
+end
 
 -- Body Frame (Enables clean minimization)
 local bodyFrame = Instance.new("Frame")
@@ -535,28 +553,36 @@ tabsContainer.Position = UDim2.new(0, 10, 0, 10)
 tabsContainer.BackgroundColor3 = Color3.fromRGB(28, 28, 36)
 tabsContainer.BorderSizePixel = 0
 tabsContainer.Parent = bodyFrame
-local sideCorner = Instance.new("UICorner") sideCorner.CornerRadius = UDim.new(0, 8) sideCorner.Parent = tabsContainer
+do
+    local sideCorner = Instance.new("UICorner") sideCorner.CornerRadius = UDim.new(0, 8) sideCorner.Parent = tabsContainer
+end
 
-local sideHeader = Instance.new("TextLabel")
-sideHeader.Size = UDim2.new(1, 0, 0, 22)
-sideHeader.BackgroundTransparency = 1
-sideHeader.Text = "MENU"
-sideHeader.TextColor3 = Color3.fromRGB(120, 120, 135)
-sideHeader.TextSize = 11
-sideHeader.Font = Enum.Font.GothamBold
-sideHeader.Parent = tabsContainer
+do
+    local sideHeader = Instance.new("TextLabel")
+    sideHeader.Size = UDim2.new(1, 0, 0, 22)
+    sideHeader.BackgroundTransparency = 1
+    sideHeader.Text = "MENU"
+    sideHeader.TextColor3 = Color3.fromRGB(120, 120, 135)
+    sideHeader.TextSize = 11
+    sideHeader.Font = Enum.Font.GothamBold
+    sideHeader.Parent = tabsContainer
+end
 
-local sideLayout = Instance.new("UIListLayout")
-sideLayout.FillDirection = Enum.FillDirection.Vertical
-sideLayout.SortOrder = Enum.SortOrder.LayoutOrder
-sideLayout.Padding = UDim.new(0, 6)
-sideLayout.VerticalAlignment = Enum.VerticalAlignment.Top
-sideLayout.Parent = tabsContainer
-local sidePadding = Instance.new("UIPadding")
-sidePadding.PaddingTop = UDim.new(0, 28)
-sidePadding.PaddingLeft = UDim.new(0, 6)
-sidePadding.PaddingRight = UDim.new(0, 6)
-sidePadding.Parent = tabsContainer
+do
+    local sideLayout = Instance.new("UIListLayout")
+    sideLayout.FillDirection = Enum.FillDirection.Vertical
+    sideLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    sideLayout.Padding = UDim.new(0, 6)
+    sideLayout.VerticalAlignment = Enum.VerticalAlignment.Top
+    sideLayout.Parent = tabsContainer
+end
+do
+    local sidePadding = Instance.new("UIPadding")
+    sidePadding.PaddingTop = UDim.new(0, 28)
+    sidePadding.PaddingLeft = UDim.new(0, 6)
+    sidePadding.PaddingRight = UDim.new(0, 6)
+    sidePadding.Parent = tabsContainer
+end
 
 local function makeTabBtn(name, order, isFirst)
 	local btn = Instance.new("TextButton")
@@ -582,12 +608,14 @@ local configTabBtn = makeTabBtn("Config", 6, false)
 local skinTabBtn = makeTabBtn("Skin", 7, false)
 
 -- Divider between sidebar and content
-local divider = Instance.new("Frame")
-divider.Size = UDim2.new(0, 1, 1, -20)
-divider.Position = UDim2.new(0, 128, 0, 10)
-divider.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
-divider.BorderSizePixel = 0
-divider.Parent = bodyFrame
+do
+    local divider = Instance.new("Frame")
+    divider.Size = UDim2.new(0, 1, 1, -20)
+    divider.Position = UDim2.new(0, 128, 0, 10)
+    divider.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+    divider.BorderSizePixel = 0
+    divider.Parent = bodyFrame
+end
 
 -- Tab Container Frames (content area, right of sidebar)
 local mainTabFrame = Instance.new("Frame")
@@ -608,9 +636,11 @@ espTabFrame.ScrollBarThickness = 6
 espTabFrame.ScrollBarImageColor3 = Color3.fromRGB(80, 80, 95)
 espTabFrame.ScrollingDirection = Enum.ScrollingDirection.Y
 espTabFrame.BorderSizePixel = 0
-local espPadding = Instance.new("UIPadding")
-espPadding.PaddingRight = UDim.new(0, 10)
-espPadding.Parent = espTabFrame
+do
+    local espPadding = Instance.new("UIPadding")
+    espPadding.PaddingRight = UDim.new(0, 10)
+    espPadding.Parent = espTabFrame
+end
 
 local miscTabFrame = Instance.new("ScrollingFrame")
 miscTabFrame.Size = UDim2.new(1, -150, 1, -20)
@@ -623,9 +653,11 @@ miscTabFrame.ScrollBarThickness = 6
 miscTabFrame.ScrollBarImageColor3 = Color3.fromRGB(80, 80, 95)
 miscTabFrame.ScrollingDirection = Enum.ScrollingDirection.Y
 miscTabFrame.BorderSizePixel = 0
-local miscPadding = Instance.new("UIPadding")
-miscPadding.PaddingRight = UDim.new(0, 10)
-miscPadding.Parent = miscTabFrame
+do
+    local miscPadding = Instance.new("UIPadding")
+    miscPadding.PaddingRight = UDim.new(0, 10)
+    miscPadding.Parent = miscTabFrame
+end
 
 local configTabFrame = Instance.new("Frame")
 configTabFrame.Size = UDim2.new(1, -150, 1, -20)
