@@ -1529,6 +1529,9 @@ function ConfigManager.collectSettings()
 		ultEspSize = ultEspSize,
 		moveEspSize = moveEspSize,
 		gojoAfterimageEnabled = gojoAfterimageEnabled,
+		gojoTeleportKey = (getgenv().PiggyMacro and getgenv().PiggyMacro.gtKey and getgenv().PiggyMacro.gtKey.Name) or nil,
+		tripleBlueKey = (getgenv().PiggyMacro and getgenv().PiggyMacro.tbKey and getgenv().PiggyMacro.tbKey.Name) or nil,
+		teleportDelay = getgenv().PiggyMacro and tonumber(getgenv().PiggyMacro.qdelay) or nil,
 		targetEspEnabled = targetEspEnabled,
 		targetEspSensitivity = targetEspSensitivity,
 		targetEspRange = targetEspRange,
@@ -1637,6 +1640,17 @@ function ConfigManager.load(name)
 	ultEspSize = data.ultEspSize or 3.0
 	moveEspSize = data.moveEspSize or 2.4
 	gojoAfterimageEnabled = data.gojoAfterimageEnabled or false
+		getgenv().PiggyMacro = getgenv().PiggyMacro or { gtKey = Enum.KeyCode.E, tbKey = Enum.KeyCode.V, qdelay = 0.1 }
+		do
+			local PM = getgenv().PiggyMacro
+			if type(data.gojoTeleportKey) == "string" then
+				PM.gtKey = Enum.KeyCode[data.gojoTeleportKey] -- nil when unbound: macro off
+			end
+			if type(data.tripleBlueKey) == "string" then
+				PM.tbKey = Enum.KeyCode[data.tripleBlueKey]
+			end
+			if tonumber(data.teleportDelay) then PM.qdelay = tonumber(data.teleportDelay) end
+		end
 	targetEspEnabled = data.targetEspEnabled or false
 	targetEspSensitivity = data.targetEspSensitivity or 0.25
 	targetEspRange = data.targetEspRange or 180
@@ -1684,6 +1698,11 @@ function ConfigManager.load(name)
 	if settingsRefs.targetBanEnabled then settingsRefs.targetBanEnabled.Set(targetBanEnabled) end
 	if settingsRefs.antiBanEnabled then settingsRefs.antiBanEnabled.Set(antiBanEnabled) end
 	if settingsRefs.gojoAfterimageEnabled then settingsRefs.gojoAfterimageEnabled.Set(gojoAfterimageEnabled) end
+	if getgenv().PiggyMacro then
+		if settingsRefs.gojoTeleportKey then settingsRefs.gojoTeleportKey.Set(getgenv().PiggyMacro.gtKey) end
+		if settingsRefs.tripleBlueKey then settingsRefs.tripleBlueKey.Set(getgenv().PiggyMacro.tbKey) end
+		if settingsRefs.teleportDelay then settingsRefs.teleportDelay.Set(getgenv().PiggyMacro.qdelay) end
+	end
 	if settingsRefs.targetEspEnabled then settingsRefs.targetEspEnabled.Set(targetEspEnabled) end
 	if settingsRefs.targetEspSensitivity then settingsRefs.targetEspSensitivity.Set(targetEspSensitivity) end
 	if settingsRefs.targetEspRange then settingsRefs.targetEspRange.Set(targetEspRange) end
@@ -2361,8 +2380,35 @@ settingsRefs.gojoAfterimageEnabled = createToggle(charactersTabFrame, "Gojo afte
     gojoAfterimageEnabled = state
 end)
 
-makeCharsHeader("Yusuke", 104)
-sgChainToggleObj = createToggle(charactersTabFrame, "Spirit Gun chain", 126, sgChainEnabled, function(state)
+do -- Gojo macro binds (ported from message version misc tab): Triple Blue + Gojo Teleport. Unbound = off.
+	getgenv().PiggyMacro = getgenv().PiggyMacro or { gtKey = Enum.KeyCode.E, tbKey = Enum.KeyCode.V, qdelay = 0.09 }
+    local gtk = createKeybind(charactersTabFrame, "Triple Blue", 104, getgenv().PiggyMacro.gtKey, function(key)
+        getgenv().PiggyMacro.gtKey = key
+    end)
+    settingsRefs.gojoTeleportKey = { Set = function(key)
+        getgenv().PiggyMacro.gtKey = key gtk.Set(key)
+    end }
+    local ttk = createKeybind(charactersTabFrame, "Gojo Teleport", 140, getgenv().PiggyMacro.tbKey, function(key)
+        getgenv().PiggyMacro.tbKey = key
+    end)
+    settingsRefs.tripleBlueKey = { Set = function(key)
+        getgenv().PiggyMacro.tbKey = key ttk.Set(key)
+    end }
+    local tsl = createSlider(charactersTabFrame, "Teleport Delay", 176, 0.0, 0.5, getgenv().PiggyMacro.qdelay or 0.09, function(val)
+        getgenv().PiggyMacro.qdelay = val
+    end, function(text, val)
+        return text .. ": " .. string.format("%.0f ms", val * 1000)
+    end)
+    settingsRefs.teleportDelay = { Set = function(val)
+        if tonumber(val) then
+            getgenv().PiggyMacro.qdelay = tonumber(val)
+            tsl.Set(tonumber(val))
+        end
+    end }
+end
+
+makeCharsHeader("Yusuke", 228)
+sgChainToggleObj = createToggle(charactersTabFrame, "Spirit Gun chain", 250, sgChainEnabled, function(state)
 	sgChainEnabled = state
 end)
 settingsRefs.sgChainEnabled = sgChainToggleObj
@@ -5311,6 +5357,13 @@ local function doParryTap(track)
 		-- Ensure we are still in blockingState and haven't transitioned to counter during the wait
 		if blockingState and not transitioningToCounter then
 			scriptFDown()
+			-- Balance flag: if a newer generation kills us after this point,
+			-- we MUST release our own press on the way out, otherwise the
+			-- game is left holding F with nobody owning it (stuck block that
+			-- only a physical F cycle clears). The killer always unblocks
+			-- first (counters scriptFUp unconditionally; a newer tap sends
+			-- its own fresh down), so releasing here is safe either way.
+			local sentDown = true
 
 			local holdDuration = autoCounterEnabled and blockHoldForCounter or blockTapDuration
 			local elapsed = 0
@@ -5325,7 +5378,13 @@ local function doParryTap(track)
 				end
 			end
 
-			if myGen ~= blockGen then return end
+			if myGen ~= blockGen then
+				if sentDown then
+					sentDown = false
+					scriptFUp()
+				end
+				return
+			end
 			if blockingState and not transitioningToCounter then
 				blockingState = false
 				if userHoldingF then
@@ -5669,6 +5728,87 @@ table.insert(connections, UserInputService.InputBegan:Connect(function(input, gp
 					task.wait(0.03)
 				end
 			end)
+		end
+	end
+
+	-- AHK ports (fire anywhere, like the originals). Unbound key = never fires.
+	do
+		local M = getgenv().PiggyMacro
+		if M then
+			local k = input.KeyCode
+			local function tap3()
+				local BC = LocalPlayer.PlayerScripts:FindFirstChild("BaseContext")
+				local m3 = BC and BC:FindFirstChild("Move3")
+				if m3 then m3:Fire(true) task.wait(0.03) m3:Fire(false) end
+			end
+			local function tapQ()
+				VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Q, false, game)
+				task.wait(0.05)
+				VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Q, false, game)
+			end
+			if M.gtKey and k == M.gtKey then
+				if M.gtBusy then
+					local DS = getgenv().PiggyMacroDbg
+					if DS then table.insert(DS, string.format("SKIP-busy %.2f", os.clock())) end
+				else
+				M.gtBusy = true
+				task.spawn(function()
+					pcall(function()
+						-- recorded manual cadence (wall-clock exact, VIM-only):
+						-- instant 3-tap, +120ms M1 (30ms hold), +60ms instant
+						-- 3-tap, +10ms Q (10ms tap). task.wait for long gaps
+						-- (yields the scheduler), spin-wait only for sub-50ms
+						-- gaps (a 200ms+ hard spin hitches follow-up inputs).
+						local D = getgenv().PiggyMacroDbg
+						if D then
+							table.insert(D, string.format("start %.2f", os.clock()))
+						end
+						local function nap(s)
+							if s >= 0.05 then task.wait(s) return end
+							local t = os.clock() + s
+							while os.clock() < t do end
+						end
+						local VIM = VirtualInputManager
+						VIM:SendKeyEvent(true, Enum.KeyCode.Three, false, game)
+						VIM:SendKeyEvent(false, Enum.KeyCode.Three, false, game)
+						nap(0.12)
+						local mp = UserInputService:GetMouseLocation()
+						VIM:SendMouseButtonEvent(mp.X, mp.Y, 0, true, game, 0)
+						nap(0.03)
+						VIM:SendMouseButtonEvent(mp.X, mp.Y, 0, false, game, 0)
+						nap(0.06)
+						VIM:SendKeyEvent(true, Enum.KeyCode.Three, false, game)
+						VIM:SendKeyEvent(false, Enum.KeyCode.Three, false, game)
+						nap(0.03)
+						VIM:SendKeyEvent(true, Enum.KeyCode.Q, false, game)
+						nap(0.01)
+						VIM:SendKeyEvent(false, Enum.KeyCode.Q, false, game)
+						local D2 = getgenv().PiggyMacroDbg
+						if D2 then
+							table.insert(D2, string.format("end %.2f", os.clock()))
+						end
+					end)
+					M.gtBusy = false
+				end)
+				end
+			end
+			if M.tbKey and not M.tbBusy and k == M.tbKey then
+				M.tbBusy = true
+				task.spawn(function()
+					pcall(function()
+						-- V teleport: single 3, slider delay, Q (VIM-only).
+						local dly = tonumber(getgenv().PiggyMacro.qdelay) or 0.09
+						VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Three, false, game)
+						task.wait(0.005)
+						VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Three, false, game)
+						task.wait(dly)
+						VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Q, false, game)
+						task.wait(0.005)
+						VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Q, false, game)
+					end)
+					M.tbBusy = false
+				end)
+			end
 		end
 	end
 
