@@ -577,8 +577,9 @@ local mainTabBtn = makeTabBtn("Lock", 1, true)
 local espTabBtn = makeTabBtn("ESP", 2, false)
 local miscTabBtn = makeTabBtn("Misc", 3, false)
 local rageTabBtn = makeTabBtn("Rage", 4, false)
-local configTabBtn = makeTabBtn("Config", 5, false)
-local skinTabBtn = makeTabBtn("Skin", 6, false)
+local charactersTabBtn = makeTabBtn("Characters", 5, false)
+local configTabBtn = makeTabBtn("Config", 6, false)
+local skinTabBtn = makeTabBtn("Skin", 7, false)
 
 -- Divider between sidebar and content
 local divider = Instance.new("Frame")
@@ -639,6 +640,13 @@ rageTabFrame.Position = UDim2.new(0, 140, 0, 10)
 rageTabFrame.BackgroundTransparency = 1
 rageTabFrame.Visible = false
 rageTabFrame.Parent = bodyFrame
+
+local charactersTabFrame = Instance.new("Frame")
+charactersTabFrame.Size = UDim2.new(1, -150, 1, -20)
+charactersTabFrame.Position = UDim2.new(0, 140, 0, 10)
+charactersTabFrame.BackgroundTransparency = 1
+charactersTabFrame.Visible = false
+charactersTabFrame.Parent = bodyFrame
 
 local skinTabFrame = Instance.new("ScrollingFrame")
 skinTabFrame.Size = UDim2.new(1, -150, 1, -20)
@@ -1394,6 +1402,26 @@ local HEAD_ATTACH_SWAY = 0.8
 local HEAD_ATTACH_SWAY_SPEED = 1.4
 local HEAD_ATTACH_SWITCH_MARGIN = 0.6
 local HEAD_ATTACH_MAX_RANGE = 16
+-- Hollow Purple chain state (Characters > Gojo). Ported from
+-- hollow_purple.luau: HP orb spawns anchored <0.15s then rides unanchored
+-- physics (~250/s, ~2.15s life), so client teleports move real server hits.
+local hpChainEnabled = false
+local hpChainToggleObj = nil
+local HP_CHAIN_RADIUS = 600
+local HP_CHAIN_DELAY = 0.02
+local HP_ARM_DELAY = 0.2
+local HP_MIN_BALL_SIZE = 8
+local HP_OWN_SHOT_RADIUS = 150
+-- Spirit Gun chain state (Characters > Yusuke). Ported from spirit_gun.luau:
+-- Yusuke Ball is small (size filter keeps HP orbs out), unanchored physics
+-- with BodyVelocity, ~6s life. Same teleport+homing treatment as HP.
+local sgChainEnabled = false
+local sgChainToggleObj = nil
+local SG_CHAIN_RADIUS = 600
+local SG_CHAIN_DELAY = 0.12
+local SG_ARM_DELAY = 0.15
+local SG_MAX_BALL_SIZE = 8
+local SG_OWN_SHOT_RADIUS = 150
 
 -- ====================== CONFIG MANAGER ======================
 local HttpService = game:GetService("HttpService")
@@ -1430,6 +1458,8 @@ function ConfigManager.collectSettings()
 		headAttachEnabled = headAttachEnabled,
 		headAttachKey = headAttachKey and headAttachKey.Name or nil,
 		headAttachOffset = headAttachOffset,
+		hpChainEnabled = hpChainEnabled,
+		sgChainEnabled = sgChainEnabled,
 		moveEspEnabled = moveEspEnabled,
 		ultEspEnabled = ultEspEnabled,
 		arrowsEnabled = arrowsEnabled,
@@ -1516,6 +1546,8 @@ function ConfigManager.load(name)
 	headAttachEnabled = data.headAttachEnabled or false
 	if data.headAttachKey then headAttachKey = Enum.KeyCode[data.headAttachKey] or nil end
 	headAttachOffset = tonumber(data.headAttachOffset) or 0
+	hpChainEnabled = data.hpChainEnabled or false
+	sgChainEnabled = data.sgChainEnabled or false
 	moveEspEnabled = data.moveEspEnabled or false
 	ultEspEnabled = data.ultEspEnabled or false
 			arrowsEnabled = data.arrowsEnabled or false
@@ -1592,6 +1624,8 @@ function ConfigManager.load(name)
 	if settingsRefs.headAttachEnabled then settingsRefs.headAttachEnabled.Set(headAttachEnabled) end
 	if settingsRefs.headAttachKey then settingsRefs.headAttachKey.Set(headAttachKey) end
 	if settingsRefs.headAttachOffset then settingsRefs.headAttachOffset.Set(headAttachOffset) end
+	if settingsRefs.hpChainEnabled then settingsRefs.hpChainEnabled.Set(hpChainEnabled) end
+	if settingsRefs.sgChainEnabled then settingsRefs.sgChainEnabled.Set(sgChainEnabled) end
 	if settingsRefs.moveEspEnabled then settingsRefs.moveEspEnabled.Set(moveEspEnabled) end
 	if settingsRefs.ultEspEnabled then settingsRefs.ultEspEnabled.Set(ultEspEnabled) end
 			if settingsRefs.arrowsEnabled then settingsRefs.arrowsEnabled.Set(arrowsEnabled) end
@@ -2260,11 +2294,254 @@ table.insert(connections, UserInputService.InputEnded:Connect(function(input)
 end))
 
 table.insert(connections, LocalPlayer.CharacterAdded:Connect(function()
-    headAttachHolding = false
-    headAttachFlying = false
-    headAttachCurrent = nil
-    headAttachOffsetDir = nil
+	task.wait(0.5)
+	if flyEnabled then setFly(true) end
 end))
+table.insert(connections, LocalPlayer.CharacterAdded:Connect(function()
+	headAttachHolding = false
+	headAttachFlying = false
+	headAttachCurrent = nil
+	headAttachOffsetDir = nil
+end))
+
+-- CHARACTERS TAB (per-character move tech, one toggle per row like other tabs).
+-- Headers mirror makeMiscHeader; toggles stack below with increasing yPos.
+local function makeCharsHeader(text, yPos)
+	local lbl = Instance.new("TextLabel")
+	lbl.Size = UDim2.new(1, 0, 0, 18)
+	lbl.Position = UDim2.new(0, 0, 0, yPos)
+	lbl.BackgroundTransparency = 1
+	lbl.Text = "═══ " .. text .. " ═══"
+	lbl.TextColor3 = Color3.fromRGB(255, 105, 180)
+	lbl.TextSize = 12
+	lbl.Font = Enum.Font.GothamBold
+	lbl.Parent = charactersTabFrame
+	return lbl
+end
+
+makeCharsHeader("Gojo", 10)
+hpChainToggleObj = createToggle(charactersTabFrame, "Hollow Purple chain", 32, hpChainEnabled, function(state)
+	hpChainEnabled = state
+end)
+settingsRefs.hpChainEnabled = hpChainToggleObj
+
+settingsRefs.gojoAfterimageEnabled = createToggle(charactersTabFrame, "Gojo afterimage (SAFETY HAZARD)", 68, gojoAfterimageEnabled, function(state)
+    gojoAfterimageEnabled = state
+end)
+
+makeCharsHeader("Yusuke", 104)
+sgChainToggleObj = createToggle(charactersTabFrame, "Spirit Gun chain", 126, sgChainEnabled, function(state)
+	sgChainEnabled = state
+end)
+settingsRefs.sgChainEnabled = sgChainToggleObj
+
+-- Hollow Purple chain core (ported from hollow_purple.luau). Single persistent
+-- Thrown listener, armed once here; the toggle only gates steering.
+local function hpLivingDummiesNear(pos, radius)
+	-- NOTE: retargeted to live PLAYERS (was dummies). Shared by Hollow Purple
+	-- and Spirit Gun chains, so both toggles now chain across players.
+	local list = {}
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player == LocalPlayer then continue end
+		-- Inline team check (isTeammate is defined later in the file, so we
+		-- can't call it from here without a forward declaration).
+		if teamCheckEnabled then
+			local teammate = false
+			pcall(function()
+				if not (LocalPlayer.Neutral or player.Neutral) then
+					if LocalPlayer.Team and player.Team then
+						teammate = (LocalPlayer.Team == player.Team or LocalPlayer.TeamColor == player.TeamColor)
+					else
+						teammate = (LocalPlayer.TeamColor == player.TeamColor)
+					end
+				end
+			end)
+			if teammate then continue end
+		end
+		local m = player.Character
+		if m then
+			local hrp = m:FindFirstChild("HumanoidRootPart")
+			local hum = m:FindFirstChildOfClass("Humanoid")
+			if hrp and hum and hum.Health > 0 then
+				local d = (hrp.Position - pos).Magnitude
+				if d < radius then
+					list[#list + 1] = { model = m, dist = d }
+				end
+			end
+		end
+	end
+	table.sort(list, function(a, b) return a.dist < b.dist end)
+	return list
+end
+
+local function hpBallSize(c)
+	local s = 0
+	pcall(function()
+		if c:IsA("BasePart") then
+			local sz = c.Size
+			s = math.max(sz.X, sz.Y, sz.Z)
+		end
+	end)
+	return s
+end
+
+local function hpZeroMovers(c)
+	pcall(function()
+		local bv = c:FindFirstChildOfClass("BodyVelocity")
+		if bv then bv.Velocity = Vector3.new(0, 0, 0) end
+		local lv = c:FindFirstChildOfClass("LinearVelocity")
+		if lv then lv.VectorVelocity = Vector3.new(0, 0, 0) end
+		local vf = c:FindFirstChildOfClass("VectorForce")
+		if vf then vf.Force = Vector3.new(0, 0, 0) end
+		if c:IsA("BasePart") and not c.Anchored then
+			c.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+			c.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+		end
+	end)
+end
+
+task.spawn(function()
+	-- Deferred (NOT tracked in connections: task.spawn returns a thread, and
+	-- the unload drain indexes .Connected unprotected) so a slow-replicating
+	-- Thrown can't break script boot. The ChildAdded hook below IS tracked.
+	local thrown = workspace:FindFirstChild("Thrown") or workspace:WaitForChild("Thrown", 15)
+	if not thrown then return end
+	table.insert(connections, thrown.ChildAdded:Connect(function(c)
+	if c.Name ~= "Ball" then return end
+	if not hpChainEnabled then return end
+	if hpBallSize(c) < HP_MIN_BALL_SIZE then return end
+	local char = LocalPlayer.Character
+	local hrp0 = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp0 then return end
+	local near = false
+	pcall(function()
+		near = (c.Position - hrp0.Position).Magnitude < HP_OWN_SHOT_RADIUS
+	end)
+	if not near then return end
+	task.spawn(function()
+		task.wait(HP_ARM_DELAY)
+		if not c.Parent then return end
+		local list = hpLivingDummiesNear(c.Position, HP_CHAIN_RADIUS)
+		for _, entry in ipairs(list) do
+			if not c.Parent then break end
+			if not hpChainEnabled then break end
+			pcall(function()
+				local m = entry.model
+				local hrp = m:FindFirstChild("HumanoidRootPart")
+				local hum = m:FindFirstChildOfClass("Humanoid")
+				if hrp and hum and hum.Health > 0 then
+					c.CFrame = hrp.CFrame
+					hpZeroMovers(c)
+				end
+			end)
+			task.wait(HP_CHAIN_DELAY)
+		end
+		local RunService = game:GetService("RunService")
+		local speed = 250
+		local conn
+		conn = RunService.Heartbeat:Connect(function()
+			if not c.Parent then conn:Disconnect() return end
+			if not hpChainEnabled then conn:Disconnect() return end
+			pcall(function()
+				if c.Anchored then return end
+				local target = hpLivingDummiesNear(c.Position, HP_CHAIN_RADIUS)[1]
+				if target then
+					local tp = target.model.HumanoidRootPart.Position
+					local dir = tp - c.Position
+					if dir.Magnitude > 2 then
+						hpZeroMovers(c)
+						c.CFrame = CFrame.new(c.Position + dir.Unit * speed * 0.016, tp)
+					end
+				end
+			end)
+		end)
+		task.delay(2, function() pcall(function() conn:Disconnect() end) end)
+	end)
+end))
+end)
+
+-- Spirit Gun chain core (ported from spirit_gun.luau). Same deferred-listener
+-- shape as HP. Small Balls only (HP orbs are size > 8 and handled above);
+-- both toggles can safely stay on together.
+task.spawn(function()
+	local thrown = workspace:FindFirstChild("Thrown") or workspace:WaitForChild("Thrown", 15)
+	if not thrown then return end
+	table.insert(connections, thrown.ChildAdded:Connect(function(c)
+	if c.Name ~= "Ball" then return end
+	if not sgChainEnabled then return end
+	if hpBallSize(c) >= SG_MAX_BALL_SIZE then return end
+	local char = LocalPlayer.Character
+	local hrp0 = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp0 then return end
+	local near = false
+	pcall(function()
+		near = (c.Position - hrp0.Position).Magnitude < SG_OWN_SHOT_RADIUS
+	end)
+	if not near then return end
+	task.spawn(function()
+		task.wait(SG_ARM_DELAY)
+		if not c.Parent then return end
+		local bv = c:FindFirstChildOfClass("BodyVelocity")
+		if bv then
+			pcall(function()
+				bv.MaxForce = Vector3.new(400000, 400000, 400000)
+			end)
+		end
+		local speed = 180
+		pcall(function()
+			if bv then speed = bv.Velocity.Magnitude end
+		end)
+		if speed < 50 then speed = 180 end
+		local list = hpLivingDummiesNear(c.Position, SG_CHAIN_RADIUS)
+		for _, entry in ipairs(list) do
+			if not c.Parent then break end
+			if not sgChainEnabled then break end
+			pcall(function()
+				local m = entry.model
+				local hrp = m:FindFirstChild("HumanoidRootPart")
+				local hum = m:FindFirstChildOfClass("Humanoid")
+				if hrp and hum and hum.Health > 0 then
+					c.CFrame = hrp.CFrame
+					local b2 = c:FindFirstChildOfClass("BodyVelocity")
+					if b2 then b2.Velocity = Vector3.new(0, 0, 0) end
+				end
+			end)
+			task.wait(SG_CHAIN_DELAY)
+		end
+		if c.Parent and bv and bv.Parent then
+			local nt = hpLivingDummiesNear(c.Position, SG_CHAIN_RADIUS)[1]
+			if nt then
+				pcall(function()
+					bv.Velocity = ((nt.model.HumanoidRootPart.Position - c.Position).Unit) * speed
+				end)
+			else
+				pcall(function()
+					bv.Velocity = c.CFrame.LookVector * speed
+				end)
+			end
+		end
+		local RunService = game:GetService("RunService")
+		local conn
+		conn = RunService.Heartbeat:Connect(function()
+			if not c.Parent then conn:Disconnect() return end
+			if not sgChainEnabled then conn:Disconnect() return end
+			pcall(function()
+				local b3 = c:FindFirstChildOfClass("BodyVelocity")
+				if not b3 then return end
+				local target = hpLivingDummiesNear(c.Position, SG_CHAIN_RADIUS)[1]
+				if target then
+					local tp = target.model.HumanoidRootPart.Position + Vector3.new(0, 1, 0)
+					local dir = tp - c.Position
+					if dir.Magnitude > 1 then
+						b3.Velocity = dir.Unit * speed
+					end
+				end
+			end)
+		end)
+		task.delay(6, function() pcall(function() conn:Disconnect() end) end)
+	end)
+end))
+end)
 
 -- ESP TAB (Move ESP, Ult ESP, Offscreen arrows, Move inputs)
 settingsRefs.moveEspEnabled = createToggle(espTabFrame, "Move ESP", 10, moveEspEnabled, function(state)
@@ -3172,10 +3449,7 @@ settingsRefs.autoBlackFlashEnabled = createToggle(miscTabFrame, "Auto Black Flas
 	applyBlackFlashHook()
 end)
 
-settingsRefs.gojoAfterimageEnabled = createToggle(miscTabFrame, "Gojo afterimage (SAFETY HAZARD)", 936, gojoAfterimageEnabled, function(state)
-    gojoAfterimageEnabled = state
-end)
-settingsRefs.autoSprintEnabled = createToggle(miscTabFrame, "Auto Sprint", 972, autoSprintEnabled, function(state)
+settingsRefs.autoSprintEnabled = createToggle(miscTabFrame, "Auto Sprint", 936, autoSprintEnabled, function(state)
     autoSprintEnabled = state
     if not state and sprintHeld then
         sprintHeld = false
@@ -3183,11 +3457,11 @@ settingsRefs.autoSprintEnabled = createToggle(miscTabFrame, "Auto Sprint", 972, 
     end
     autoSaveSettings()
 end)
-settingsRefs.autoPlayEnabled = createToggle(miscTabFrame, "Auto Play", 1008, autoPlayEnabled, function(state)
+settingsRefs.autoPlayEnabled = createToggle(miscTabFrame, "Auto Play", 972, autoPlayEnabled, function(state)
     autoPlayEnabled = state
 end)
 
-settingsRefs.toggleUIKey = createKeybind(miscTabFrame, "Close/Open UI", 1044, toggleUIKey, function(key)
+settingsRefs.toggleUIKey = createKeybind(miscTabFrame, "Close/Open UI", 1008, toggleUIKey, function(key)
     toggleUIKey = key
 end)
 
@@ -3321,7 +3595,7 @@ if oldTB then oldTB:Destroy() end
 local tbContainer = Instance.new("Frame")
 tbContainer.Name = "TargetBanContainer"
 tbContainer.Size = UDim2.new(1, 0, 0, 186)
-tbContainer.Position = UDim2.new(0, 0, 0, 1082)
+tbContainer.Position = UDim2.new(0, 0, 0, 1046)
 tbContainer.BackgroundTransparency = 1
 tbContainer.ClipsDescendants = false
 tbContainer.Parent = miscTabFrame
@@ -3743,7 +4017,7 @@ end))
 -- PS Code Snatch Button
 local snatchBtn = Instance.new("TextButton")
 snatchBtn.Size = UDim2.new(1, 0, 0, 32)
-snatchBtn.Position = UDim2.new(0, 0, 0, 1312)
+snatchBtn.Position = UDim2.new(0, 0, 0, 1276)
 snatchBtn.BackgroundColor3 = Color3.fromRGB(115, 95, 230) -- Purple theme
 snatchBtn.Text = "PS Code Snatch"
 snatchBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -3755,7 +4029,7 @@ local snatchCorner = Instance.new("UICorner") snatchCorner.CornerRadius = UDim.n
 -- Test Hold Block button (holds F indefinitely until repressed; for triggerbot testing)
 local testHoldBtn = Instance.new("TextButton")
 testHoldBtn.Size = UDim2.new(1, 0, 0, 32)
-testHoldBtn.Position = UDim2.new(0, 0, 0, 1348)
+testHoldBtn.Position = UDim2.new(0, 0, 0, 1312)
 testHoldBtn.BackgroundColor3 = Color3.fromRGB(115, 95, 230) -- Purple theme
 testHoldBtn.Text = "Hold Block (Test)"
 testHoldBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -3941,7 +4215,7 @@ end)
 
 local nanamiBtn = Instance.new("TextButton")
 nanamiBtn.Size = UDim2.new(1, 0, 0, 32)
-nanamiBtn.Position = UDim2.new(0, 0, 0, 1276)
+nanamiBtn.Position = UDim2.new(0, 0, 0, 1240)
 nanamiBtn.BackgroundColor3 = Color3.fromRGB(115, 95, 230) -- Purple theme
 nanamiBtn.Text = "Auto Nanami"
 nanamiBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -3957,7 +4231,7 @@ end)
 -- Unload button inside Misc tab
 local unloadBtn = Instance.new("TextButton")
 unloadBtn.Size = UDim2.new(1, 0, 0, 32)
-unloadBtn.Position = UDim2.new(0, 0, 0, 1384)
+unloadBtn.Position = UDim2.new(0, 0, 0, 1348)
 unloadBtn.BackgroundColor3 = Color3.fromRGB(240, 80, 80)
 unloadBtn.Text = "Unload UI"
 unloadBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -3971,7 +4245,7 @@ end)
 
 local creditsLabel = Instance.new("TextLabel")
 creditsLabel.Size = UDim2.new(1, 0, 0, 20)
-creditsLabel.Position = UDim2.new(0, 0, 0, 1420)
+creditsLabel.Position = UDim2.new(0, 0, 0, 1384)
 creditsLabel.BackgroundTransparency = 1
 creditsLabel.Text = "Credits: @ace_rsss & kyoka"
 creditsLabel.TextColor3 = Color3.fromRGB(120, 120, 120)
@@ -3985,8 +4259,9 @@ local function setTab(tabName)
 	mainTabFrame.Visible = (tabName == "Lock")
 	espTabFrame.Visible = (tabName == "ESP")
 	miscTabFrame.Visible = (tabName == "Misc")
-	rageTabFrame.Visible = (tabName == "Rage")
-	configTabFrame.Visible = (tabName == "Config")
+ 	rageTabFrame.Visible = (tabName == "Rage")
+ 	charactersTabFrame.Visible = (tabName == "Characters")
+ 	configTabFrame.Visible = (tabName == "Config")
 	skinTabFrame.Visible = (tabName == "Skin")
 	
 	TweenService:Create(mainTabBtn, TweenInfo.new(0.18), {
@@ -4004,12 +4279,17 @@ local function setTab(tabName)
 		TextColor3 = (tabName == "Misc") and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(150, 150, 170)
 	}):Play()
 	
-	TweenService:Create(rageTabBtn, TweenInfo.new(0.18), {
-		BackgroundColor3 = (tabName == "Rage") and Color3.fromRGB(255, 105, 180) or Color3.fromRGB(35, 35, 45),
-		TextColor3 = (tabName == "Rage") and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(150, 150, 170)
-	}):Play()
-	
-	TweenService:Create(configTabBtn, TweenInfo.new(0.18), {
+ 	TweenService:Create(rageTabBtn, TweenInfo.new(0.18), {
+ 		BackgroundColor3 = (tabName == "Rage") and Color3.fromRGB(255, 105, 180) or Color3.fromRGB(35, 35, 45),
+ 		TextColor3 = (tabName == "Rage") and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(150, 150, 170)
+ 	}):Play()
+ 	
+ 	TweenService:Create(charactersTabBtn, TweenInfo.new(0.18), {
+ 		BackgroundColor3 = (tabName == "Characters") and Color3.fromRGB(255, 105, 180) or Color3.fromRGB(35, 35, 45),
+ 		TextColor3 = (tabName == "Characters") and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(150, 150, 170)
+ 	}):Play()
+ 	
+ 	TweenService:Create(configTabBtn, TweenInfo.new(0.18), {
 		BackgroundColor3 = (tabName == "Config") and Color3.fromRGB(255, 105, 180) or Color3.fromRGB(35, 35, 45),
 		TextColor3 = (tabName == "Config") and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(150, 150, 170)
 	}):Play()
@@ -4024,6 +4304,7 @@ mainTabBtn.MouseButton1Click:Connect(function() setTab("Lock") end)
 espTabBtn.MouseButton1Click:Connect(function() setTab("ESP") end)
 miscTabBtn.MouseButton1Click:Connect(function() setTab("Misc") end)
 rageTabBtn.MouseButton1Click:Connect(function() setTab("Rage") end)
+charactersTabBtn.MouseButton1Click:Connect(function() setTab("Characters") end)
 configTabBtn.MouseButton1Click:Connect(function() setTab("Config") end)
 skinTabBtn.MouseButton1Click:Connect(function() setTab("Skin") end)
 
@@ -4100,6 +4381,8 @@ unloadScript = function()
 	flyEnabled = false
 	cleanupFlyMovers()
 	headAttachEnabled = false
+	hpChainEnabled = false
+	sgChainEnabled = false
 	headAttachHolding = false
 	headAttachFlying = false
 	headAttachCurrent = nil
@@ -5407,16 +5690,11 @@ table.insert(connections, UserInputService.InputBegan:Connect(function(input, gp
 		end)
 	end
 
-	-- Triggerbot Move 1 fire request: start trying to fire slot 1 (auto-enables).
+	-- Triggerbot Move 1 fire request: start trying to fire slot 1.
+	-- Disabled master toggle means keybinds are ignored entirely.
 	-- Re-pressing the same key while its request is still pending cancels it
 	-- early (unmarks if no other request remains) instead of retargeting.
-	if input.KeyCode == triggerbotKey then
-		if not triggerbotEnabled then
-			triggerbotEnabled = true
-			if triggerbotToggleObj then
-				triggerbotToggleObj.Set(true)
-			end
-		end
+	if input.KeyCode == triggerbotKey and triggerbotEnabled then
 		if triggerbot1Pending then
 			clearTriggerRequest(1, "Triggerbot cancelled (slot " .. tostring(triggerbotSlot) .. ")")
 		else
@@ -5434,16 +5712,11 @@ table.insert(connections, UserInputService.InputBegan:Connect(function(input, gp
 		end
 	end
 
-	-- Triggerbot Move 2 fire request: start trying to fire slot 2 (auto-enables).
+	-- Triggerbot Move 2 fire request: start trying to fire slot 2.
+	-- Disabled master toggle means keybinds are ignored entirely.
 	-- Re-pressing the same key while its request is still pending cancels it
 	-- early (unmarks if no other request remains) instead of retargeting.
-	if input.KeyCode == triggerbot2Key then
-		if not triggerbotEnabled then
-			triggerbotEnabled = true
-			if triggerbotToggleObj then
-				triggerbotToggleObj.Set(true)
-			end
-		end
+	if input.KeyCode == triggerbot2Key and triggerbotEnabled then
 		if triggerbot2Pending then
 			clearTriggerRequest(2, "Triggerbot cancelled (slot " .. tostring(triggerbot2Slot) .. ")")
 		else
