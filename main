@@ -1529,8 +1529,8 @@ function ConfigManager.collectSettings()
 		ultEspSize = ultEspSize,
 		moveEspSize = moveEspSize,
 		gojoAfterimageEnabled = gojoAfterimageEnabled,
-		gojoTeleportKey = (getgenv().PiggyMacro and getgenv().PiggyMacro.gtKey and getgenv().PiggyMacro.gtKey.Name) or nil,
-		tripleBlueKey = (getgenv().PiggyMacro and getgenv().PiggyMacro.tbKey and getgenv().PiggyMacro.tbKey.Name) or nil,
+		gojoTeleportKey = (getgenv().PiggyMacro and getgenv().PiggyMacro.gtKey and getgenv().PiggyMacro.gtKey.Name) or "None",
+		tripleBlueKey = (getgenv().PiggyMacro and getgenv().PiggyMacro.tbKey and getgenv().PiggyMacro.tbKey.Name) or "None",
 		teleportDelay = getgenv().PiggyMacro and tonumber(getgenv().PiggyMacro.qdelay) or nil,
 		targetEspEnabled = targetEspEnabled,
 		targetEspSensitivity = targetEspSensitivity,
@@ -1643,11 +1643,24 @@ function ConfigManager.load(name)
 		getgenv().PiggyMacro = getgenv().PiggyMacro or { gtKey = Enum.KeyCode.E, tbKey = Enum.KeyCode.V, qdelay = 0.1 }
 		do
 			local PM = getgenv().PiggyMacro
-			if type(data.gojoTeleportKey) == "string" then
-				PM.gtKey = Enum.KeyCode[data.gojoTeleportKey] -- nil when unbound: macro off
+			-- "None"/"" = explicitly unbound: macro off. Missing (nil) =
+			-- legacy file from before these binds were saved: keep default.
+			-- (JSONEncode drops nil, so the old `if type(...) == "string"`
+			-- check could never clear a bind — an unbind resurrected the
+			-- default E/V on next autoload.)
+			if data.gojoTeleportKey ~= nil then
+				if type(data.gojoTeleportKey) == "string" and data.gojoTeleportKey ~= "None" and data.gojoTeleportKey ~= "" then
+					PM.gtKey = Enum.KeyCode[data.gojoTeleportKey] -- nil if unknown name: macro off
+				else
+					PM.gtKey = nil
+				end
 			end
-			if type(data.tripleBlueKey) == "string" then
-				PM.tbKey = Enum.KeyCode[data.tripleBlueKey]
+			if data.tripleBlueKey ~= nil then
+				if type(data.tripleBlueKey) == "string" and data.tripleBlueKey ~= "None" and data.tripleBlueKey ~= "" then
+					PM.tbKey = Enum.KeyCode[data.tripleBlueKey]
+				else
+					PM.tbKey = nil
+				end
 			end
 			if tonumber(data.teleportDelay) then PM.qdelay = tonumber(data.teleportDelay) end
 		end
@@ -5416,6 +5429,7 @@ end
 local AIR_SWING_TIMEOUT = 1.5 -- backstop: must exceed max slider delay + MAX_LATE
 local AIR_SWING_MAX_LATE = 0.25 -- max seconds past the delay we still punish (older = too stale, drop it)
 local AIR_SWING_SELF_GUARD = 0.15 -- seconds after our own M1 that we don't arm a new punish (room to block)
+local AIR_SWING_FRESH_WINDOW = 0.25 -- only arm on swings first seen this early in playback (larger = stale track, skip it)
 local airSwingArmed = nil -- { root, t0 } (tracking only, never touches block)
 
 -- True when WE are holding block right now (key down, or the game showing it).
@@ -5474,8 +5488,8 @@ local function findAirSwingTarget(localHrp)
 				end
 				if alreadySeen then continue end
 
-				local animIdNum = (tostring(animId):match("%d+")) or ""
-				if sharedM1AnimIds[animIdNum] then
+			local animIdNum = (tostring(animId):match("%d+")) or ""
+			if sharedM1AnimIds[animIdNum] then
 					table.insert(lastBlockedAnims, { Track = track, Time = os.clock() })
 					return track, hrp
 				end
@@ -5521,7 +5535,7 @@ local function airSwingFire()
 	local wasUserHolding = userHoldingF
 	local hadScriptHold = blockingState
 
-	-- Unblock/time/reblock mechanics only -- there is no impact trigger here.
+			-- Unblock/time/reblock mechanics only -- there is no impact trigger here.
 	-- The server eats M1s thrown while blocking, so F must be released for the
 	-- punish to exist at all, then re-pressed so a physical hold survives intact.
 	task.spawn(function()
@@ -5529,8 +5543,10 @@ local function airSwingFire()
 			blockingState = false
 			scriptFUp()
 
-			-- Tiny settle only (capped): the timing already came from the impact delay
-			task.wait(math.min(counterM1Delay, 0.03))
+			-- Full Counter Delay, same as the block-impact path below: the Air
+			-- Swing Delay slider positioned the punish in their recovery, this
+			-- lets our block physics drop so the M1 isn't swallowed.
+			task.wait(counterM1Delay)
 
 			if myGen ~= counterGen then return end
 			triggerCounterM1()
@@ -6426,15 +6442,24 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 			pcall(function() startOffset = track.TimePosition or 0 end)
 		end
 		if type(startOffset) ~= "number" or startOffset < 0 then startOffset = 0 end
-		-- Clamp backdate: only compensate small gate lag (frame + 0.03 throttle).
-		-- Fresh sees (toggle-on / walk-into-range mid-swing) get ~full delay from now, no instant fire.
-		startOffset = math.min(startOffset, 0.08)
-		-- Track only: no F press while tracking, so a physical hold is
-		-- never disturbed until the fire instant (see fire rules above).
-		airSwingArmed = {
-			root = enemyRoot,
-			t0 = now - startOffset,
-		}
+		-- Freshness gate: only arm on swings that genuinely just started. A
+		-- track first seen deep into playback is stale, not a fresh swing --
+		-- typically the fade-out of their block pose on a block -> M1 flicker
+		-- (Blocking flag clears before the M1 replicates) or a previous swing
+		-- still playing when the next one starts. Anchoring to it phases the
+		-- timer to the WRONG swing, so the punish fires inside the real
+		-- swing's startup and gets us punished. So don't arm on it -- the
+		-- real fresh track (new object) still arms when it shows up.
+		-- Genuine first sights (replication + gate lag) land well inside the window, and the truthful backdate below makes
+		-- fire land at true start + delay every time instead of only sometimes.
+		if startOffset <= AIR_SWING_FRESH_WINDOW then
+			-- Track only: no F press while tracking, so a physical hold is
+			-- never disturbed until the fire instant (see fire rules above).
+			airSwingArmed = {
+				root = enemyRoot,
+				t0 = now - startOffset,
+			}
+		end
 	end
 end))
 
