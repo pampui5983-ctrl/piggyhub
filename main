@@ -1482,13 +1482,13 @@ function ConfigManager.collectSettings()
 		predictionEnabled = predictionEnabled,
 		predictionStrength = predictionStrength,
 		smoothness = smoothness,
-		lockKey = lockKey.Name,
+		lockKey = (lockKey and lockKey.Name) or "None",
 		lockMode = lockMode,
 		flyEnabled = flyEnabled,
-		flyKey = flyKey and flyKey.Name or nil,
+		flyKey = (flyKey and flyKey.Name) or "None",
 		flySpeed = flySpeed,
 		headAttachEnabled = headAttachEnabled,
-		headAttachKey = headAttachKey and headAttachKey.Name or nil,
+		headAttachKey = (headAttachKey and headAttachKey.Name) or "None",
 		headAttachOffset = headAttachOffset,
 		hpChainEnabled = hpChainEnabled,
 		sgChainEnabled = sgChainEnabled,
@@ -1501,17 +1501,17 @@ function ConfigManager.collectSettings()
 		blockTapDuration = blockTapDuration,
 		counterM1Delay = counterM1Delay,
 		autoCounterEnabled = autoCounterEnabled,
-		counterKey = counterKey.Name,
+		counterKey = (counterKey and counterKey.Name) or "None",
 		airSwingEnabled = airSwingEnabled,
 		swingRange = swingRange,
 		airSwingDelay = airSwingDelay,
 		triggerbotEnabled = triggerbotEnabled,
-		triggerbotKey = triggerbotKey.Name,
+		triggerbotKey = (triggerbotKey and triggerbotKey.Name) or "None",
 		triggerbotSlot = triggerbotSlot,
-		triggerbot2Key = triggerbot2Key.Name,
+		triggerbot2Key = (triggerbot2Key and triggerbot2Key.Name) or "None",
 		triggerbot2Slot = triggerbot2Slot,
-		autoInfinityKey = autoInfinityKey.Name,
-		toggleUIKey = toggleUIKey.Name,
+		autoInfinityKey = (autoInfinityKey and autoInfinityKey.Name) or "None",
+		toggleUIKey = (toggleUIKey and toggleUIKey.Name) or "None",
 		autoBlackFlashEnabled = autoBlackFlashEnabled,
 		autoInfinityEnabled = autoInfinityEnabled,
 		autoInfinityUnlocked = autoInfinityUnlocked,
@@ -1545,6 +1545,18 @@ function ConfigManager.save(name)
 	writefile(CONFIG_FOLDER .. name .. ".json", json)
 end
 
+-- Keybind decode shared by ConfigManager.load: "None"/"" = explicitly unbound
+-- (nil), missing (nil) = legacy file from before the bind was saved (keep
+-- current), unknown string = keep current. JSONEncode drops nil, so saving
+-- unbound binds as nil would make them resurrect defaults on next load --
+-- collectSettings must save "None" instead (see the gojo keybind fix).
+local function decodeKeybind(saved, current)
+	if saved == nil then return current end
+	if saved == "None" or saved == "" then return nil end
+	if type(saved) == "string" and Enum.KeyCode[saved] then return Enum.KeyCode[saved] end
+	return current
+end
+
 function ConfigManager.load(name)
 	local path = CONFIG_FOLDER .. name .. ".json"
 	if not isfile then return false, "isfile not available" end
@@ -1561,7 +1573,7 @@ function ConfigManager.load(name)
 	predictionEnabled = data.predictionEnabled or false
 	predictionStrength = data.predictionStrength or 0.15
 	smoothness = data.smoothness or 0.25
-	if data.lockKey then lockKey = Enum.KeyCode[data.lockKey] or lockKey end
+	if data.lockKey then lockKey = decodeKeybind(data.lockKey, lockKey) end
 	do
 		local mode = data.lockMode
 		if mode ~= "Off" and mode ~= "Camera" and mode ~= "Silent" then
@@ -1575,11 +1587,11 @@ function ConfigManager.load(name)
 		applyLockMode(mode)
 	end
 	flyEnabled = data.flyEnabled or false
-	if data.flyKey then flyKey = Enum.KeyCode[data.flyKey] or nil end
+	if data.flyKey then flyKey = decodeKeybind(data.flyKey, flyKey) end
 	flySpeed = data.flySpeed or 50
 	if flyEnabled then pcall(setFly, true) end
 	headAttachEnabled = data.headAttachEnabled or false
-	if data.headAttachKey then headAttachKey = Enum.KeyCode[data.headAttachKey] or nil end
+	if data.headAttachKey then headAttachKey = decodeKeybind(data.headAttachKey, headAttachKey) end
 	headAttachOffset = tonumber(data.headAttachOffset) or 0
 	hpChainEnabled = data.hpChainEnabled or false
 	sgChainEnabled = data.sgChainEnabled or false
@@ -1597,13 +1609,13 @@ function ConfigManager.load(name)
 	swingRange = data.swingRange or 18
 	airSwingDelay = data.airSwingDelay or 0.40
 	triggerbotEnabled = data.triggerbotEnabled or data.triggerbot2Enabled or false
-	if data.triggerbotKey then triggerbotKey = Enum.KeyCode[data.triggerbotKey] or triggerbotKey end
+	if data.triggerbotKey then triggerbotKey = decodeKeybind(data.triggerbotKey, triggerbotKey) end
 	if type(data.triggerbotSlot) == "number" then triggerbotSlot = math.clamp(math.floor(data.triggerbotSlot), 1, 4) end
-	if data.triggerbot2Key then triggerbot2Key = Enum.KeyCode[data.triggerbot2Key] or triggerbot2Key end
+	if data.triggerbot2Key then triggerbot2Key = decodeKeybind(data.triggerbot2Key, triggerbot2Key) end
 	if type(data.triggerbot2Slot) == "number" then triggerbot2Slot = math.clamp(math.floor(data.triggerbot2Slot), 1, 4) end
-	if data.counterKey then counterKey = Enum.KeyCode[data.counterKey] or counterKey end
-	if data.autoInfinityKey then autoInfinityKey = Enum.KeyCode[data.autoInfinityKey] or autoInfinityKey end
-	if data.toggleUIKey then toggleUIKey = Enum.KeyCode[data.toggleUIKey] or toggleUIKey end
+	if data.counterKey then counterKey = decodeKeybind(data.counterKey, counterKey) end
+	if data.autoInfinityKey then autoInfinityKey = decodeKeybind(data.autoInfinityKey, autoInfinityKey) end
+	if data.toggleUIKey then toggleUIKey = decodeKeybind(data.toggleUIKey, toggleUIKey) end
 	autoBlackFlashEnabled = data.autoBlackFlashEnabled or false
 	autoInfinityEnabled = data.autoInfinityEnabled or false
 	autoInfinityUnlocked = data.autoInfinityUnlocked or false
@@ -1643,25 +1655,9 @@ function ConfigManager.load(name)
 		getgenv().PiggyMacro = getgenv().PiggyMacro or { gtKey = Enum.KeyCode.E, tbKey = Enum.KeyCode.V, qdelay = 0.1 }
 		do
 			local PM = getgenv().PiggyMacro
-			-- "None"/"" = explicitly unbound: macro off. Missing (nil) =
-			-- legacy file from before these binds were saved: keep default.
-			-- (JSONEncode drops nil, so the old `if type(...) == "string"`
-			-- check could never clear a bind — an unbind resurrected the
-			-- default E/V on next autoload.)
-			if data.gojoTeleportKey ~= nil then
-				if type(data.gojoTeleportKey) == "string" and data.gojoTeleportKey ~= "None" and data.gojoTeleportKey ~= "" then
-					PM.gtKey = Enum.KeyCode[data.gojoTeleportKey] -- nil if unknown name: macro off
-				else
-					PM.gtKey = nil
-				end
-			end
-			if data.tripleBlueKey ~= nil then
-				if type(data.tripleBlueKey) == "string" and data.tripleBlueKey ~= "None" and data.tripleBlueKey ~= "" then
-					PM.tbKey = Enum.KeyCode[data.tripleBlueKey]
-				else
-					PM.tbKey = nil
-				end
-			end
+			-- decodeKeybind: "None" = unbound (macro off), missing = legacy file (keep default).
+			PM.gtKey = decodeKeybind(data.gojoTeleportKey, PM.gtKey)
+			PM.tbKey = decodeKeybind(data.tripleBlueKey, PM.tbKey)
 			if tonumber(data.teleportDelay) then PM.qdelay = tonumber(data.teleportDelay) end
 		end
 	targetEspEnabled = data.targetEspEnabled or false
