@@ -221,7 +221,15 @@ table.insert(connections, UserInputService.InputEnded:Connect(function(input)
 			return
 		end
 		pendingUpEcho = 0
-		userHoldingF = false
+		if userHoldingF then
+			userHoldingF = false
+			blockGen = blockGen + 1
+			counterGen = counterGen + 1
+			blockingState = false
+			airSwingArmed = nil
+			testHoldBlock = false
+			scriptFUp()
+		end
 	end
 end))
 pcall(function() userHoldingF = UserInputService:IsKeyDown(Enum.KeyCode.F) end)
@@ -5617,7 +5625,17 @@ local function setupGlobalCounterListener()
 	local function onBlockImpact()
 		do end
 		if not autoCounterEnabled then return end
-		if not isOpponentPlayingM1() then return end
+		-- Use recent M1 detection cache (race condition fix): BlockSound can fire
+		-- after the M1 anim track is no longer enumerable, so isOpponentPlayingM1()
+		-- alone is unreliable. lastBlockedAnims is populated by checkShouldBlock.
+		local now = os.clock()
+		for i = #lastBlockedAnims, 1, -1 do
+			if now - lastBlockedAnims[i].Time > 1.0 then
+				table.remove(lastBlockedAnims, i)
+			end
+		end
+		local hasRecentM1 = #lastBlockedAnims > 0
+		if not hasRecentM1 and not isOpponentPlayingM1() then return end
 		
 		if transitioningToCounter then return end
 		transitioningToCounter = true
@@ -5690,11 +5708,8 @@ local function setupGlobalCounterListener()
 
 		-- Listen for BlockSound being added or played dynamically
 		blockHrpConnection = hrp.ChildAdded:Connect(function(child)
-			if child:IsA("Sound") and (string.find(child.Name:lower(), "block") or child.Name == "BlockSound") then do end
+			if child:IsA("Sound") and (string.find(child.name:lower(), "block") or child.name == "BlockSound") then do end
 				bindSound(child)
-				
-				-- Trigger counter immediately since sound spawned during impact
-				onBlockImpact()
 			end
 		end)
 		table.insert(connections, blockHrpConnection)
