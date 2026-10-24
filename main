@@ -1,6 +1,8 @@
 -- STEALTH PATCH: silent mode - no console output, no traces on unload
 -- (all print/warn calls rewritten to do end below)
 -- original boot print removed
+-- EXCEPTION: the COUNTER DIAGNOSTICS block below prints to the local console
+-- unless getgenv().PiggyCounterPrint = false (file logging stays available).
 do -- stealth: suppress SendNotification popups (no visual trace)
     pcall(function()
         local sg = game:GetService("StarterGui")
@@ -173,6 +175,12 @@ local moveEspSize = 2.4
 local targetEspEnabled = true
 local targetEspBillboard = nil
 local targetEspAlertTime = 0
+-- Player PiP (viewport spectator): master switch + selected target
+local pipEnabled = false
+local pipAutoturn = false
+local pipTargetName = ""
+local pipSetEnabled, pipSetTarget -- forward: assigned by the Player PiP block
+local pipCleanup -- forward: assigned by the Player PiP block (unload)
 local gojoAfterimageEnabled = false
 local gojoBlueActive = false
 local originalBlackFlashHandler = nil
@@ -190,6 +198,177 @@ local VirtualInputManager = game:GetService("VirtualInputManager")
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
+-- ====================== COUNTER DIAGNOSTICS ======================
+-- Behaviour-neutral tracing for Auto Block / Auto Counter / Air Swing.
+-- Toggle at runtime:
+--   getgenv().PiggyCounterDiagOn = false   -- stop logging
+--   getgenv().PiggyCounterFile = false     -- no file output
+--   getgenv().PiggyCounterPrint = false    -- keep stealth console silent
+--   getgenv().PiggyCounterVerbose = true   -- per-frame/guard spam
+-- Dump the ring buffer: getgenv().PiggyCounterDump(200)
+-- Clear it:             getgenv().PiggyCounterClear()
+-- File (when the executor supports appendfile): PiggyHub/counter_diag.log
+local counterDiagEnv = _G
+pcall(function()
+	if typeof(getgenv) == "function" and getgenv() then counterDiagEnv = getgenv() end
+end)
+if counterDiagEnv.PiggyCounterDiagOn == nil then counterDiagEnv.PiggyCounterDiagOn = true end
+if counterDiagEnv.PiggyCounterFile == nil then counterDiagEnv.PiggyCounterFile = true end
+if counterDiagEnv.PiggyCounterPrint == nil then counterDiagEnv.PiggyCounterPrint = true end
+if counterDiagEnv.PiggyCounterVerbose == nil then counterDiagEnv.PiggyCounterVerbose = false end
+
+local counterDiagEntries = {}
+counterDiagEnv.PiggyCounterDiag = counterDiagEntries
+local counterDiagMax = 600
+local counterDiagThrottle = {}
+
+local counterDiagFileQueue = {}
+local function counterDiagFlush()
+	if #counterDiagFileQueue == 0 then return end
+	local chunk = table.concat(counterDiagFileQueue, "\n") .. "\n"
+	for i = #counterDiagFileQueue, 1, -1 do counterDiagFileQueue[i] = nil end
+	if not counterDiagEnv.PiggyCounterFile then return end
+	pcall(function()
+		if typeof(makefolder) == "function" and typeof(isfolder) == "function" and not isfolder("PiggyHub") then
+			makefolder("PiggyHub")
+		end
+		if typeof(appendfile) == "function" then
+			appendfile("PiggyHub/counter_diag.log", chunk)
+		end
+	end)
+end
+local function counterDiagAppend(line)
+	if not counterDiagEnv.PiggyCounterFile then return end
+	table.insert(counterDiagFileQueue, line)
+	-- Flush in batches from the heartbeat (see watchdog below); only force an
+	-- early flush if the buffer gets large, so the hot F/M1 paths never wait
+	-- on disk I/O.
+	if #counterDiagFileQueue >= 200 then counterDiagFlush() end
+end
+
+local function counterDiag(evt, ...)
+	if not counterDiagEnv.PiggyCounterDiagOn then return end
+	local parts = {}
+	for i = 1, select("#", ...) do
+		parts[i] = tostring(select(i, ...))
+	end
+	local line = string.format("[CDIAG %.3f] %s %s", os.clock(), tostring(evt), table.concat(parts, " "))
+	table.insert(counterDiagEntries, line)
+	if #counterDiagEntries > counterDiagMax then table.remove(counterDiagEntries, 1) end
+	if counterDiagEnv.PiggyCounterPrint then print(line) end
+	counterDiagAppend(line)
+end
+
+local function counterDiagThrottled(key, interval, evt, ...)
+	local now = os.clock()
+	local last = counterDiagThrottle[key]
+	if last and now - last < interval then return end
+	counterDiagThrottle[key] = now
+	counterDiag(evt, ...)
+end
+
+counterDiagEnv.PiggyCounterDump = function(n)
+	local total = #counterDiagEntries
+	local first = math.max(1, total - (tonumber(n) or 120) + 1)
+	print(string.format("[CDIAG] ----- dump %d/%d -----", first, total))
+	for i = first, total do print(counterDiagEntries[i]) end
+	print("[CDIAG] ----- end dump -----")
+	return table.concat(counterDiagEntries, "\n", first, total)
+end
+counterDiagEnv.PiggyCounterClear = function()
+	for i = #counterDiagEntries, 1, -1 do counterDiagEntries[i] = nil end
+	print("[CDIAG] cleared")
+end
+
+local counterTransitionStart = 0
+local counterTransitionWarned = false
+local counterDiagSendRecords = {}
+local counterDiagSharedM1Ids = nil -- assigned after sharedM1AnimIds is built
+
+local function counterDiagBlocking()
+	local bits = {}
+	local char = LocalPlayer.Character
+	local b = char and char:FindFirstChild("Blocking")
+	if b then
+		if b:IsA("BoolValue") or b:IsA("ValueBase") then
+			bits[#bits + 1] = "blockVal=" .. tostring(b.Value)
+		else
+			bits[#bits + 1] = "blockVal=<object>"
+		end
+	else
+		bits[#bits + 1] = "blockVal=nil"
+	end
+	if char then bits[#bits + 1] = "blockAttr=" .. tostring(char:GetAttribute("Blocking")) end
+	bits[#bits + 1] = "isKeyDownF=" .. tostring(UserInputService:IsKeyDown(Enum.KeyCode.F))
+	bits[#bits + 1] = "userHoldingF=" .. tostring(userHoldingF)
+	bits[#bits + 1] = "blockingState=" .. tostring(blockingState)
+	bits[#bits + 1] = "pendingDown=" .. tostring(pendingDownEcho)
+	bits[#bits + 1] = "pendingUp=" .. tostring(pendingUpEcho)
+	if lastDownStamp > 0 then bits[#bits + 1] = string.format("downAge=%.3f", os.clock() - lastDownStamp) end
+	if lastUpStamp > 0 then bits[#bits + 1] = string.format("upAge=%.3f", os.clock() - lastUpStamp) end
+	local pingOk, ping = pcall(function() return LocalPlayer:GetNetworkPing() end)
+	if pingOk and type(ping) == "number" and ping > 0 then
+		bits[#bits + 1] = string.format("pingMs=%.0f", ping * 1000)
+	end
+	return table.concat(bits, " ")
+end
+
+local function counterDiagNoteM1Send(tag)
+	if not counterDiagEnv.PiggyCounterDiagOn then return end
+	local rec = { t = os.clock(), tag = tostring(tag or "?"), seen = false }
+	table.insert(counterDiagSendRecords, rec)
+	for i = #counterDiagSendRecords, 1, -1 do
+		if os.clock() - counterDiagSendRecords[i].t > 10 then table.remove(counterDiagSendRecords, i) end
+	end
+	task.delay(0.8, function()
+		if not rec.seen then
+			counterDiag("NO_OWN_M1_ANIM", "src=" .. rec.tag,
+				string.format("sinceSend=%.3f", os.clock() - rec.t),
+				counterDiagBlocking())
+		end
+	end)
+end
+
+local function counterDiagOnOwnAnim(track)
+	if not counterDiagEnv.PiggyCounterDiagOn then return end
+	local now = os.clock()
+	local aid = track and track.Animation and track.Animation.AnimationId
+	local name = track and track.Name or "?"
+	local idNum = aid and (tostring(aid):match("%d+")) or ""
+	local isM1 = counterDiagSharedM1Ids and counterDiagSharedM1Ids[idNum] or false
+	local recent
+	for i = #counterDiagSendRecords, 1, -1 do
+		local rec = counterDiagSendRecords[i]
+		if now - rec.t <= 1.5 and not rec.seen then
+			recent = rec
+			break
+		end
+	end
+	if not recent then
+		if counterDiagEnv.PiggyCounterVerbose then
+			counterDiag("OWN_ANIM_BG", "name=" .. tostring(name), "id=" .. tostring(aid))
+		end
+		return
+	end
+	if isM1 then
+		recent.seen = true
+		counterDiag("OWN_M1_ANIM", "src=" .. recent.tag, "name=" .. tostring(name),
+			"id=" .. tostring(aid), string.format("sinceSend=%.3f", now - recent.t),
+			counterDiagBlocking())
+	else
+		-- Not a known M1 ID: log it so an unknown/new M1 id is visible, but do
+		-- not mark the send as answered (a block-release pose must not hide a
+		-- swallowed M1).
+		counterDiag("OWN_ANIM_NEAR", "src=" .. recent.tag, "isM1Id=false",
+			"name=" .. tostring(name), "id=" .. tostring(aid),
+			string.format("sinceSend=%.3f", now - recent.t))
+	end
+end
+
+counterDiag("DIAG_READY", "on=" .. tostring(counterDiagEnv.PiggyCounterDiagOn),
+	"file=" .. tostring(counterDiagEnv.PiggyCounterFile),
+	"dump=getgenv().PiggyCounterDump()")
+
 -- Script-owned F presses expect exactly one InputBegan/Ended echo each, so the
 -- userHoldingF tracker below can tell synthetic presses apart from a physical
 -- finger with no timing blind spots and no IsKeyDown polling. Zero delay:
@@ -197,30 +376,44 @@ local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 local function scriptFDown()
 	pendingDownEcho = pendingDownEcho + 1
 	lastDownStamp = os.clock()
+	counterDiag("SCRIPT_F_DOWN", "pendingDown=" .. tostring(pendingDownEcho),
+		"blockingState=" .. tostring(blockingState), "transitioning=" .. tostring(transitioningToCounter))
 	pcall(function() VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game) end)
 end
 local function scriptFUp()
 	pendingUpEcho = pendingUpEcho + 1
 	lastUpStamp = os.clock()
+	counterDiag("SCRIPT_F_UP", "pendingUp=" .. tostring(pendingUpEcho),
+		"blockingState=" .. tostring(blockingState), "transitioning=" .. tostring(transitioningToCounter))
 	pcall(function() VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game) end)
 end
 table.insert(connections, UserInputService.InputBegan:Connect(function(input, _gp)
 	if input.KeyCode == Enum.KeyCode.F and input.UserInputType == Enum.UserInputType.Keyboard then
 		if pendingDownEcho > 0 and os.clock() - lastDownStamp < ECHO_WINDOW then
 			pendingDownEcho = pendingDownEcho - 1
+			counterDiag("F_DOWN_ECHO", "pendingDown=" .. tostring(pendingDownEcho),
+				string.format("age=%.3f", os.clock() - lastDownStamp))
 			return
 		end
 		pendingDownEcho = 0
 		userHoldingF = true
+		counterDiag("F_DOWN_PHYS", counterDiagBlocking())
 	end
 end))
 table.insert(connections, UserInputService.InputEnded:Connect(function(input)
 	if input.KeyCode == Enum.KeyCode.F and input.UserInputType == Enum.UserInputType.Keyboard then
 		if pendingUpEcho > 0 and os.clock() - lastUpStamp < ECHO_WINDOW then
 			pendingUpEcho = pendingUpEcho - 1
+			counterDiag("F_UP_ECHO", "pendingUp=" .. tostring(pendingUpEcho),
+				string.format("age=%.3f", os.clock() - lastUpStamp),
+				"userHoldingF=" .. tostring(userHoldingF))
 			return
 		end
 		pendingUpEcho = 0
+		counterDiag("F_UP_PHYS", "userHoldingF=" .. tostring(userHoldingF),
+			"counterGen=" .. tostring(counterGen),
+			"transitioning=" .. tostring(transitioningToCounter),
+			"blockingState=" .. tostring(blockingState))
 		if userHoldingF then
 			userHoldingF = false
 			blockGen = blockGen + 1
@@ -228,7 +421,12 @@ table.insert(connections, UserInputService.InputEnded:Connect(function(input)
 			blockingState = false
 			airSwingArmed = nil
 			testHoldBlock = false
+			counterDiag("F_UP_BUMP", "counterGen=" .. tostring(counterGen),
+				"transitioning=" .. tostring(transitioningToCounter),
+				"LEAK_WINDOW=" .. tostring(transitioningToCounter))
 			scriptFUp()
+		else
+			counterDiag("F_UP_PHYS_IGNORED", "reason=userHoldingF=false")
 		end
 	end
 end))
@@ -639,7 +837,7 @@ espTabFrame.Position = UDim2.new(0, 140, 0, 10)
 espTabFrame.BackgroundTransparency = 1
 espTabFrame.Visible = false
 espTabFrame.Parent = bodyFrame
-espTabFrame.CanvasSize = UDim2.new(0, 0, 0, 420)
+espTabFrame.CanvasSize = UDim2.new(0, 0, 0, 512)
 espTabFrame.ScrollBarThickness = 6
 espTabFrame.ScrollBarImageColor3 = Color3.fromRGB(80, 80, 95)
 espTabFrame.ScrollingDirection = Enum.ScrollingDirection.Y
@@ -1543,6 +1741,9 @@ function ConfigManager.collectSettings()
 		targetEspEnabled = targetEspEnabled,
 		targetEspSensitivity = targetEspSensitivity,
 		targetEspRange = targetEspRange,
+		pipEnabled = pipEnabled,
+		pipAutoturn = pipAutoturn,
+		pipTargetName = pipTargetName,
 	}
 end
 
@@ -1671,6 +1872,9 @@ function ConfigManager.load(name)
 	targetEspEnabled = data.targetEspEnabled or false
 	targetEspSensitivity = data.targetEspSensitivity or 0.25
 	targetEspRange = data.targetEspRange or 180
+	pipEnabled = data.pipEnabled == true
+	pipAutoturn = data.pipAutoturn == true
+	pipTargetName = data.pipTargetName or ""
 	autoInfinityLookSensitivity = data.autoInfinityLookSensitivity or 0.5
 	autoInfinityRayRadius = data.autoInfinityRayRadius or 40
 	
@@ -1727,6 +1931,11 @@ function ConfigManager.load(name)
 	if settingsRefs.autoInfinityRayRadius then settingsRefs.autoInfinityRayRadius.Set(autoInfinityRayRadius) end
 	if settingsRefs.ultEspSize then settingsRefs.ultEspSize.Set(ultEspSize) end
 	if settingsRefs.moveEspSize then settingsRefs.moveEspSize.Set(moveEspSize) end
+	-- Player PiP: restore the saved target first, then the switch
+	if pipSetTarget and pipTargetName ~= "" then pcall(pipSetTarget, pipTargetName) end
+	if settingsRefs.pipEnabled then settingsRefs.pipEnabled.Set(pipEnabled) end
+	if settingsRefs.pipAutoturn then settingsRefs.pipAutoturn.Set(pipAutoturn) end
+	if pipSetEnabled then pcall(pipSetEnabled, pipEnabled) end
 updateCounterLabel()
 	updateInfinityLabel()
 end)
@@ -2727,6 +2936,905 @@ settingsRefs.moveInputsEnabled = createToggle(espTabFrame, "Move inputs", 50, mo
 		end
 	end
 end)
+
+-- ====================== PLAYER PIP ======================
+-- ViewportFrame "spectator": mirrors the selected player, the players standing
+-- near them and the static geometry around them into a small draggable window.
+--   drag near an edge -> move the window
+--   drag in the middle-> orbit the PiP camera (cursor is pinned for the drag)
+--   mouse wheel       -> zoom the PiP camera in / out
+-- Roblox only renders workspace.CurrentCamera for the real world and a
+-- ViewportFrame renders only its own descendants, hence the clones.
+;(function()
+	local UIS = UserInputService
+	local RS = RunService
+
+	local WINDOW_W, WINDOW_H = 300, 169
+	local MARGIN, TOP_SAFE = 18, 58
+	local CAM_DIST_MIN, CAM_DIST_MAX = 3.5, 45
+	local ORBIT_SENS, ZOOM_STEP = 0.007, 0.12
+	local EDGE_MARGIN, LOOK_AT_Y = 26, 1.2
+	local WORLD_RADIUS, WORLD_BUDGET = 160, 800
+	local WORLD_FULL_BUDGET = 4000 -- maps with fewer parts than this are mirrored whole
+	local SNAP_REFRESH_DIST, SNAP_MIN_INTERVAL = 45, 1.2
+	local ANIM_HZ, ANIM_DRIFT = 15, 0.10
+	local APPEAR_CHECK_HZ, APPEAR_MAX_REBUILDS = 2, 4
+	local MIRROR_NEARBY_DIST = 90
+	local AUTO_YAW_RATE = 5.0 -- rad/s the PiP view swings toward the target's run direction
+	local DEFAULT_GREY = Color3.fromRGB(163, 162, 165)
+
+	-- drop a window left behind by an earlier run of this file / the prototype
+	do
+		local old = parentGui:FindFirstChild("PiggyPiP")
+		if old then pcall(function() old:Destroy() end) end
+		pcall(function()
+			local stop = getgenv and getgenv().__pipStop
+			if type(stop) == "function" then stop() end
+		end)
+	end
+
+	local pipTarget
+	local camDist = 12
+	local yaw, pitch = 0, math.rad(22)
+	local pipAutoYaw = nil -- last forward-run heading (radians) the view swings to
+	local mirrors, attempts, playerConns = {}, {}, {}
+	local snapCenter, snapAt = nil, 0
+	local worldFull = false
+	local mapPartCount = 0
+	local animAcc, appearAcc = 0, 0
+	local fps, frames, acc = 0, 0, 0
+	local placed = false
+	local dragMode, dragStart, dragOrigin
+
+	-- forward handles (assigned below, called by the tab controls / unload)
+	local applyEnabled, refreshButton, refreshPlayerList, setTarget
+
+	-- window chrome --------------------------------------------------------
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "PiggyPiP"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder = 999
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	gui.Enabled = false
+	gui.Parent = parentGui
+
+	local holder = Instance.new("Frame")
+	holder.Name = "Holder"
+	holder.Size = UDim2.fromOffset(WINDOW_W, WINDOW_H)
+	holder.BackgroundColor3 = Color3.fromRGB(10, 10, 14)
+	holder.BorderSizePixel = 0
+	holder.ClipsDescendants = true
+	holder.Active = true
+	holder.Parent = gui
+	do
+		local c = Instance.new("UICorner") c.CornerRadius = UDim.new(0, 8) c.Parent = holder
+		local s = Instance.new("UIStroke") s.Color = Color3.fromRGB(255, 105, 180) s.Thickness = 1 s.Transparency = 0.35 s.Parent = holder
+	end
+
+	local vp = Instance.new("ViewportFrame")
+	vp.Name = "View"
+	vp.Size = UDim2.fromScale(1, 1)
+	vp.BackgroundColor3 = Color3.fromRGB(38, 44, 58)
+	vp.BorderSizePixel = 0
+	vp.Ambient = Color3.fromRGB(190, 190, 200)
+	vp.LightColor = Color3.fromRGB(255, 255, 255)
+	vp.LightDirection = Vector3.new(-0.4, -1, -0.6)
+	vp.Parent = holder
+
+	local world = Instance.new("WorldModel")
+	world.Parent = vp
+
+	local cam = Instance.new("Camera")
+	cam.FieldOfView = 55
+	cam.Parent = vp
+	vp.CurrentCamera = cam
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(1, -20, 0, 20)
+	label.Position = UDim2.new(0, 10, 0, 6)
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.GothamBold
+	label.TextSize = 13
+	label.TextColor3 = Color3.new(1, 1, 1)
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.TextStrokeTransparency = 0.4
+	label.Text = "Player PiP"
+	label.Parent = holder
+
+	-- input ----------------------------------------------------------------
+	local mouseLocked = false
+	local savedMouseBehavior = nil
+	local mutedInputs = {}
+	local canMuteInputs = type(getconnections) == "function"
+
+	local function muteGameInput()
+		if not canMuteInputs or #mutedInputs > 0 then return end
+		local ok, list = pcall(getconnections, UIS.InputChanged)
+		if not ok or type(list) ~= "table" then return end
+		for _, c in ipairs(list) do
+			if pcall(function() c:Disable() end) then
+				mutedInputs[#mutedInputs + 1] = c
+			end
+		end
+	end
+
+	local function unmuteGameInput()
+		for i = #mutedInputs, 1, -1 do
+			local c = mutedInputs[i]
+			pcall(function() c:Enable() end)
+			mutedInputs[i] = nil
+		end
+	end
+
+	local function lockMouse()
+		if mouseLocked then return end
+		mouseLocked = true
+		savedMouseBehavior = UIS.MouseBehavior
+		UIS.MouseBehavior = Enum.MouseBehavior.LockCurrentPosition
+		muteGameInput()
+	end
+
+	local function unlockMouse()
+		if not mouseLocked then return end
+		mouseLocked = false
+		UIS.MouseBehavior = savedMouseBehavior or Enum.MouseBehavior.Default
+		savedMouseBehavior = nil
+		unmuteGameInput()
+	end
+
+	local function isDragInput(input)
+		return input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch
+	end
+
+	local function pointInEdge(input)
+		local size = holder.AbsoluteSize
+		-- InputObject.Position is a Vector3; AbsolutePosition is a Vector2
+		local p = Vector2.new(input.Position.X, input.Position.Y) - holder.AbsolutePosition
+		return p.X <= EDGE_MARGIN
+			or p.Y <= EDGE_MARGIN
+			or p.X >= size.X - EDGE_MARGIN
+			or p.Y >= size.Y - EDGE_MARGIN
+	end
+
+	local function endDrag()
+		dragMode = nil
+		unlockMouse()
+	end
+
+	table.insert(connections, holder.InputBegan:Connect(function(input)
+		if not isDragInput(input) then return end
+		dragOrigin = holder.Position
+		if pointInEdge(input) then
+			unlockMouse()
+			dragMode = "move"
+			dragStart = UIS:GetMouseLocation()
+		else
+			dragMode = "orbit"
+			lockMouse()
+		end
+	end))
+
+	table.insert(connections, UIS.InputEnded:Connect(function(input)
+		if isDragInput(input) then endDrag() end
+	end))
+
+	local function zoom(notches)
+		camDist = math.clamp(camDist * (1 - notches * ZOOM_STEP), CAM_DIST_MIN, CAM_DIST_MAX)
+	end
+
+	table.insert(connections, holder.MouseWheelForward:Connect(function() zoom(1) end))
+	table.insert(connections, holder.MouseWheelBackward:Connect(function() zoom(-1) end))
+
+	local function updateInput()
+		if not dragMode then return end
+		if not UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
+			endDrag()
+			return
+		end
+
+		local now = UIS:GetMouseLocation()
+
+		if dragMode == "move" then
+			local delta = now - dragStart
+			local viewport = gui.AbsoluteSize
+			local nx = dragOrigin.X.Offset + delta.X
+			local ny = dragOrigin.Y.Offset + delta.Y
+			nx = math.clamp(nx, -WINDOW_W + 40, math.max(-WINDOW_W + 40, viewport.X - 40))
+			ny = math.clamp(ny, -WINDOW_H + 40, math.max(-WINDOW_H + 40, viewport.Y - 40))
+			holder.Position = UDim2.fromOffset(math.floor(nx), math.floor(ny))
+		else
+			-- cursor is pinned, only relative motion is available
+			if not mouseLocked then lockMouse() end
+			if UIS.MouseBehavior ~= Enum.MouseBehavior.LockCurrentPosition then
+				UIS.MouseBehavior = Enum.MouseBehavior.LockCurrentPosition
+			end
+			local delta = UIS:GetMouseDelta()
+			if delta.Magnitude > 0 then
+				yaw = yaw - delta.X * ORBIT_SENS
+				pitch = math.clamp(pitch + delta.Y * ORBIT_SENS, math.rad(-45), math.rad(80))
+			end
+		end
+	end
+
+	-- character mirrors ----------------------------------------------------
+	local function stripClone(c)
+		local doomed = {}
+		for _, d in ipairs(c:GetDescendants()) do
+			if d:IsA("BaseScript") or d:IsA("ModuleScript") then table.insert(doomed, d) end
+		end
+		for _, d in ipairs(doomed) do d:Destroy() end
+		c.PrimaryPart = c:FindFirstChild("HumanoidRootPart") or c.PrimaryPart
+	end
+
+	local function makeMirror(char)
+		local c = char:Clone()
+		stripClone(c)
+		c.Name = "__mirror_" .. char.Name
+		c.Parent = world
+		local hum = c:FindFirstChildOfClass("Humanoid")
+		if hum and not hum:FindFirstChildOfClass("Animator") then
+			local a = Instance.new("Animator")
+			a.Parent = hum
+		end
+		return { char = char, clone = c, tracks = {}, nextAppearCheck = os.clock() + 0.35 }
+	end
+
+	local function dropMirror(entry)
+		for _, t in pairs(entry.tracks) do
+			pcall(function() t:Stop(0) end)
+		end
+		entry.tracks = {}
+		pcall(function() entry.clone:Destroy() end)
+	end
+
+	local function visualSignature(root)
+		local s = { shirt = 0, pants = 0, acc = 0, mesh = 0, grey = 0, parts = 0 }
+		for _, d in ipairs(root:GetDescendants()) do
+			if d:IsA("Shirt") or d:IsA("ShirtGraphic") then
+				s.shirt = s.shirt + 1
+			elseif d:IsA("Pants") then
+				s.pants = s.pants + 1
+			elseif d:IsA("Accessory") or d:IsA("Hat") then
+				s.acc = s.acc + 1
+			elseif d:IsA("MeshPart") then
+				s.mesh = s.mesh + 1
+			end
+			if d:IsA("BasePart") then
+				s.parts = s.parts + 1
+				local col = d.Color
+				if math.abs(col.R - DEFAULT_GREY.R) < 0.02
+					and math.abs(col.G - DEFAULT_GREY.G) < 0.02
+					and math.abs(col.B - DEFAULT_GREY.B) < 0.02 then
+					s.grey = s.grey + 1
+				end
+			end
+		end
+		return s
+	end
+
+	local function needsRebuild(live, clone)
+		local a = visualSignature(live)
+		local b = visualSignature(clone)
+		if a.shirt > b.shirt then return true end
+		if a.pants > b.pants then return true end
+		if a.acc > b.acc then return true end
+		if a.mesh > b.mesh then return true end
+		if b.grey > a.grey then return true end
+		return false
+	end
+
+	local function syncAnimations(entry, liveChar)
+		local liveHum = liveChar:FindFirstChildOfClass("Humanoid")
+		local cloneHum = entry.clone:FindFirstChildOfClass("Humanoid")
+		if not liveHum or not cloneHum then return end
+		if liveHum.Health <= 0 then return end
+		local liveAnim = liveHum:FindFirstChildOfClass("Animator")
+		if not liveAnim then return end
+		local cloneAnim = cloneHum:FindFirstChildOfClass("Animator")
+		if not cloneAnim then return end
+
+		local playing = {}
+		local ok, tracks = pcall(function()
+			return liveAnim:GetPlayingAnimationTracks()
+		end)
+		if ok and tracks then
+			for _, t in ipairs(tracks) do
+				local anim = t.Animation
+				local id = anim and anim.AnimationId
+				if id and id ~= "" then playing[id] = t end
+			end
+		end
+
+		for id, ct in pairs(entry.tracks) do
+			if not playing[id] then
+				pcall(function() ct:Stop(0.1) end)
+				entry.tracks[id] = nil
+			end
+		end
+
+		for id, lt in pairs(playing) do
+			local ct = entry.tracks[id]
+			if not ct then
+				local ok2, newTrack = pcall(function()
+					return cloneAnim:LoadAnimation(lt.Animation)
+				end)
+				if ok2 and newTrack then
+					newTrack:Play(0, lt.WeightCurrent, lt.Speed)
+					newTrack.TimePosition = lt.TimePosition
+					entry.tracks[id] = newTrack
+					ct = newTrack
+				end
+			end
+			if ct then
+				local drift = ct.TimePosition - lt.TimePosition
+				if math.abs(drift) > ANIM_DRIFT and lt.Speed ~= 0 then
+					ct.TimePosition = lt.TimePosition
+				end
+				if math.abs(ct.Speed - lt.Speed) > 0.01 then
+					ct:AdjustSpeed(lt.Speed)
+				end
+				if math.abs(ct.WeightCurrent - lt.WeightCurrent) > 0.05 then
+					ct:AdjustWeight(lt.WeightCurrent, 0.1)
+				end
+			end
+		end
+	end
+
+	local function collectStaticParts()
+		local list = {}
+		for _, d in ipairs(workspace:GetDescendants()) do
+			if d:IsA("BasePart") and d.Transparency < 1 then
+				local ok, p = true, d
+				while p and p ~= workspace do
+					if Players:GetPlayerFromCharacter(p) or p:IsA("Accessory") or p:IsA("Tool") then
+						ok = false
+						break
+					end
+					p = p.Parent
+				end
+				if ok then list[#list + 1] = d end
+			end
+		end
+		return list
+	end
+
+	local function commitSnapshot(snap)
+		local previous = {}
+		for _, ch in ipairs(world:GetChildren()) do
+			if ch.Name == "__worldsnap" then table.insert(previous, ch) end
+		end
+		snap.Name = "__worldsnap"
+		snap.Parent = world
+		for _, ch in ipairs(previous) do pcall(function() ch:Destroy() end) end
+	end
+
+	local function cloneInto(snap, list)
+		local n = 0
+		for _, d in ipairs(list) do
+			local ok, c = pcall(function() return d:Clone() end)
+			if ok and c then
+				c.Anchored = true
+				c.CanCollide = false
+				c.Parent = snap
+				n = n + 1
+			end
+		end
+		return n
+	end
+
+	local function addGroundPlane(snap, center, radius)
+		for _, c in ipairs(snap:GetChildren()) do
+			if c:IsA("BasePart") then
+				local dx = math.abs(c.Position.X - center.X)
+				local dz = math.abs(c.Position.Z - center.Z)
+				if dx < 16 and dz < 16 and c.Position.Y <= center.Y + 1 then return end
+			end
+		end
+		local plane = Instance.new("Part")
+		plane.Anchored = true
+		plane.CanCollide = false
+		plane.Size = Vector3.new(radius * 2, 1, radius * 2)
+		plane.Position = center - Vector3.new(0, 3, 0)
+		plane.Color = Color3.fromRGB(175, 176, 184)
+		plane.Material = Enum.Material.SmoothPlastic
+		plane.TopSurface = Enum.SurfaceType.Smooth
+		plane.BottomSurface = Enum.SurfaceType.Smooth
+		plane.Parent = snap
+	end
+
+	-- Whole-map mirror: if the map fits the budget it is cloned once, so the PiP
+	-- never shows a floating island that lags behind the target. Chunked across
+	-- frames so enabling the toggle does not freeze the client.
+	local function buildFullWorld()
+		local list = collectStaticParts()
+		if #list > WORLD_FULL_BUDGET then return false end
+		worldFull = true
+		mapPartCount = #list
+		snapAt = os.clock()
+		local snap = Instance.new("Model")
+		task.spawn(function()
+			for i = 1, #list, 150 do
+				for j = i, math.min(i + 149, #list) do
+					local ok, c = pcall(function() return list[j]:Clone() end)
+					if ok and c then
+						c.Anchored = true
+						c.CanCollide = false
+						c.Parent = snap
+					end
+				end
+				task.wait()
+				if not pipEnabled or not worldFull then
+					pcall(function() snap:Destroy() end)
+					return
+				end
+			end
+			commitSnapshot(snap)
+		end)
+		return true
+	end
+
+	-- Fallback for very large maps: a radius patch around the target that follows it.
+	local function snapshotWorld(center, radius, budget)
+		if radius <= 0 then return 0 end
+		local cand = {}
+		for _, d in ipairs(collectStaticParts()) do
+			local dist = (d.Position - center).Magnitude
+			if dist <= radius then table.insert(cand, { part = d, dist = dist }) end
+		end
+		table.sort(cand, function(a, b) return a.dist < b.dist end)
+		local list = {}
+		for i = 1, math.min(budget, #cand) do list[i] = cand[i].part end
+		local snap = Instance.new("Model")
+		local n = cloneInto(snap, list)
+		addGroundPlane(snap, center, radius)
+		commitSnapshot(snap)
+		worldFull = false
+		mapPartCount = n
+		return n
+	end
+
+	local function checkFullWorld()
+		if not pipEnabled or not worldFull then return end
+		local count = 0
+		for _, d in ipairs(workspace:GetDescendants()) do
+			if d:IsA("BasePart") then count = count + 1 end
+		end
+		if math.abs(count - mapPartCount) > math.max(30, mapPartCount * 0.05) then
+			buildFullWorld()
+		end
+	end
+
+	local function attemptCount(plr, char)
+		local a = attempts[plr]
+		if not a or a.char ~= char then return 0 end
+		return a.n
+	end
+
+	local function bumpAttempt(plr, char)
+		local a = attempts[plr]
+		if not a or a.char ~= char then
+			a = { char = char, n = 0 }
+			attempts[plr] = a
+		end
+		a.n = a.n + 1
+		return a.n
+	end
+
+	local function forceRebuild(plr)
+		local entry = mirrors[plr]
+		if not entry then return end
+		if bumpAttempt(plr, entry.char) > APPEAR_MAX_REBUILDS then return end
+		dropMirror(entry)
+		mirrors[plr] = nil
+	end
+
+	local function markRebuild(plr)
+		local entry = mirrors[plr]
+		if not entry then return end
+		if attemptCount(plr, entry.char) >= APPEAR_MAX_REBUILDS then return end
+		forceRebuild(plr)
+	end
+
+	local function bindPlayer(plr)
+		if playerConns[plr] then return end
+		local conns = {}
+		conns[#conns + 1] = plr.CharacterAppearanceLoaded:Connect(function()
+			task.delay(0.05, function() markRebuild(plr) end)
+		end)
+		conns[#conns + 1] = plr.CharacterAdded:Connect(function()
+			task.delay(0.05, function() markRebuild(plr) end)
+		end)
+		playerConns[plr] = conns
+	end
+
+	local function unbindAll()
+		for _, list in pairs(playerConns) do
+			for _, c in ipairs(list) do pcall(function() c:Disconnect() end) end
+		end
+		playerConns = {}
+	end
+
+	local function wantsMirror(plr)
+		if plr == pipTarget then return true end
+		local tc = pipTarget and pipTarget.Character
+		local thrp = tc and tc:FindFirstChild("HumanoidRootPart")
+		local hrc = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+		if not (thrp and hrc) then return false end
+		return (hrc.Position - thrp.Position).Magnitude <= MIRROR_NEARBY_DIST
+	end
+
+	local function resolveTarget(preferred)
+		if preferred and preferred ~= "" then
+			local p = Players:FindFirstChild(preferred)
+			if p then return p end
+		end
+		local fallback
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p ~= LocalPlayer then return p end
+			fallback = fallback or p
+		end
+		return fallback
+	end
+
+	local function clearSnapOnly()
+		for _, ch in ipairs(world:GetChildren()) do
+			if ch.Name == "__worldsnap" then pcall(function() ch:Destroy() end) end
+		end
+		snapCenter, snapAt = nil, 0
+		worldFull = false
+		mapPartCount = 0
+	end
+
+	local function clearMirrors()
+		for _, entry in pairs(mirrors) do dropMirror(entry) end
+		mirrors = {}
+		attempts = {}
+		clearSnapOnly()
+	end
+
+	-- ESP tab controls -----------------------------------------------------
+	local ddRow = Instance.new("Frame")
+	ddRow.Size = UDim2.new(1, 0, 0, 32)
+	ddRow.Position = UDim2.new(0, 0, 0, 466)
+	ddRow.BackgroundTransparency = 1
+	ddRow.ZIndex = 20 -- keep the popup above the sliders it opens over
+	ddRow.Parent = espTabFrame
+
+	local ddLabel = Instance.new("TextLabel")
+	ddLabel.Size = UDim2.new(1, -160, 1, 0)
+	ddLabel.BackgroundTransparency = 1
+	ddLabel.Text = "Spectate Player"
+	ddLabel.TextColor3 = Color3.fromRGB(245, 245, 250)
+	ddLabel.TextSize = 13
+	ddLabel.Font = Enum.Font.GothamMedium
+	ddLabel.TextXAlignment = Enum.TextXAlignment.Left
+	ddLabel.Parent = ddRow
+
+	local ddBtn = Instance.new("TextButton")
+	ddBtn.Size = UDim2.new(0, 150, 0, 24)
+	ddBtn.Position = UDim2.new(1, -150, 0.5, -12)
+	ddBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+	ddBtn.Text = "No one"
+	ddBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	ddBtn.Font = Enum.Font.GothamBold
+	ddBtn.TextSize = 12
+	ddBtn.TextTruncate = Enum.TextTruncate.AtEnd
+	ddBtn.AutoButtonColor = false
+	ddBtn.Parent = ddRow
+	do
+		local c = Instance.new("UICorner") c.CornerRadius = UDim.new(0, 6) c.Parent = ddBtn
+		local s = Instance.new("UIStroke") s.Color = Color3.fromRGB(60, 60, 75) s.Thickness = 1 s.Parent = ddBtn
+	end
+
+	local ddList = Instance.new("Frame")
+	ddList.Size = UDim2.new(0, 150, 0, 136)
+	ddList.Position = UDim2.new(1, -150, 0, -140)
+	ddList.BackgroundColor3 = Color3.fromRGB(20, 18, 28)
+	ddList.BorderSizePixel = 0
+	ddList.Visible = false
+	ddList.ZIndex = 20
+	ddList.ClipsDescendants = true
+	ddList.Parent = ddRow
+	do
+		local c = Instance.new("UICorner") c.CornerRadius = UDim.new(0, 6) c.Parent = ddList
+		local s = Instance.new("UIStroke") s.Color = Color3.fromRGB(60, 60, 75) s.Thickness = 1 s.Parent = ddList
+	end
+
+	local ddScroll = Instance.new("ScrollingFrame")
+	ddScroll.Size = UDim2.new(1, 0, 1, 0)
+	ddScroll.BackgroundTransparency = 1
+	ddScroll.BorderSizePixel = 0
+	ddScroll.ScrollBarThickness = 4
+	ddScroll.ScrollBarImageColor3 = Color3.fromRGB(80, 80, 95)
+	ddScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+	ddScroll.ZIndex = 20
+	ddScroll.Parent = ddList
+
+	refreshButton = function()
+		if pipTarget and pipTarget.Parent then
+			ddBtn.Text = pipTarget.Name
+			ddBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+		else
+			ddBtn.Text = "No one"
+			ddBtn.TextColor3 = Color3.fromRGB(150, 150, 170)
+		end
+	end
+
+	refreshPlayerList = function()
+		for _, ch in ipairs(ddScroll:GetChildren()) do
+			if ch:IsA("TextButton") then ch:Destroy() end
+		end
+		local list = {}
+		for _, p in ipairs(Players:GetPlayers()) do table.insert(list, p) end
+		table.sort(list, function(a, b) return a.Name:lower() < b.Name:lower() end)
+		local y = 0
+		for _, p in ipairs(list) do
+			local opt = Instance.new("TextButton")
+			opt.Size = UDim2.new(1, -4, 0, 22)
+			opt.Position = UDim2.new(0, 2, 0, y + 2)
+			opt.BackgroundColor3 = (p == pipTarget) and Color3.fromRGB(70, 45, 65) or Color3.fromRGB(30, 28, 38)
+			opt.Text = (p == LocalPlayer) and (p.Name .. "  (you)") or p.Name
+			opt.TextColor3 = Color3.fromRGB(230, 230, 240)
+			opt.Font = Enum.Font.Gotham
+			opt.TextSize = 12
+			opt.TextTruncate = Enum.TextTruncate.AtEnd
+			opt.TextXAlignment = Enum.TextXAlignment.Left
+			opt.BorderSizePixel = 0
+			opt.ZIndex = 20
+			opt.Parent = ddScroll
+			opt.MouseButton1Click:Connect(function()
+				setTarget(p)
+				ddList.Visible = false
+				autoSaveSettings()
+			end)
+			opt.MouseEnter:Connect(function()
+				opt.BackgroundColor3 = Color3.fromRGB(50, 48, 58)
+			end)
+			opt.MouseLeave:Connect(function()
+				opt.BackgroundColor3 = (p == pipTarget) and Color3.fromRGB(70, 45, 65) or Color3.fromRGB(30, 28, 38)
+			end)
+			y = y + 24
+		end
+		ddScroll.CanvasSize = UDim2.new(0, 0, 0, y + 4)
+		ddScroll.CanvasPosition = Vector2.zero
+	end
+
+	setTarget = function(p)
+		if not p then return end
+		pipTarget = p
+		pipTargetName = p.Name
+		pipAutoYaw = nil
+		refreshButton()
+		if pipEnabled then clearMirrors() end
+	end
+
+	ddBtn.MouseButton1Click:Connect(function()
+		ddList.Visible = not ddList.Visible
+		if ddList.Visible then refreshPlayerList() end
+	end)
+
+	table.insert(connections, Players.PlayerAdded:Connect(function()
+		if ddList.Visible then refreshPlayerList() end
+	end))
+	table.insert(connections, Players.PlayerRemoving:Connect(function(plr)
+		if pipTarget == plr then
+			pipTarget = nil
+			refreshButton()
+		end
+		if ddList.Visible then refreshPlayerList() end
+	end))
+
+	applyEnabled = function(state)
+		pipEnabled = state and true or false
+		if pipEnabled then
+			if not pipTarget or not pipTarget.Parent then
+				pipTarget = resolveTarget(pipTargetName)
+				pipTargetName = pipTarget and pipTarget.Name or ""
+			end
+			refreshButton()
+			gui.Enabled = true
+			clearSnapOnly()
+			if not buildFullWorld() then snapCenter = nil end
+			if not placed then
+				placed = true
+				task.defer(function()
+					local vs = gui.AbsoluteSize
+					if vs.X > 0 then
+						local x = math.clamp(MARGIN, 0, math.max(0, vs.X - WINDOW_W))
+						local y = math.clamp(TOP_SAFE, 0, math.max(0, vs.Y - WINDOW_H - MARGIN))
+						holder.Position = UDim2.fromOffset(x, y)
+					end
+				end)
+			end
+		else
+			gui.Enabled = false
+			ddList.Visible = false
+			pcall(unlockMouse)
+			dragMode = nil
+			clearMirrors()
+			unbindAll()
+		end
+	end
+
+	local pipToggleRef = createToggle(espTabFrame, "Player PiP", 386, pipEnabled, function(state)
+		applyEnabled(state)
+	end)
+	settingsRefs.pipEnabled = pipToggleRef
+
+	local pipAutoturnRef = createToggle(espTabFrame, "PiP Autoturn", 424, pipAutoturn, function(state)
+		pipAutoturn = state
+	end)
+	settingsRefs.pipAutoturn = pipAutoturnRef
+
+	pipSetEnabled = function(state)
+		pipToggleRef.Set(state and true or false)
+		applyEnabled(state)
+	end
+
+	pipSetTarget = function(name)
+		local p = Players:FindFirstChild(tostring(name or ""))
+		if p then setTarget(p) end
+	end
+
+	pipCleanup = function()
+		pcall(unlockMouse)
+		pcall(unbindAll)
+		for _, entry in pairs(mirrors) do pcall(dropMirror, entry) end
+		mirrors = {}
+		pcall(function() gui:Destroy() end)
+		if getgenv().__pipState then getgenv().__pipState = nil end
+	end
+
+	getgenv().__pipState = function()
+		return string.format("enabled=%s autoturn=%s autoYaw=%s target=%s mirrors=%d world=%s(%d) dist=%.1f yaw=%.1f pitch=%.1f label=%q",
+			tostring(pipEnabled), tostring(pipAutoturn),
+			pipAutoYaw and string.format("%.1f", math.deg(pipAutoYaw)) or "nil",
+			pipTarget and pipTarget.Name or "none",
+			(function() local n = 0 for _ in pairs(mirrors) do n = n + 1 end return n end)(),
+			worldFull and "full" or "radius", mapPartCount,
+			camDist, math.deg(yaw), math.deg(pitch), label.Text)
+	end
+
+	-- follow loop ----------------------------------------------------------
+	table.insert(connections, RS.RenderStepped:Connect(function(dt)
+		if not pipEnabled then return end
+
+		pcall(updateInput)
+		if mouseLocked and not UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
+			pcall(endDrag)
+		end
+
+		if not pipTarget or not pipTarget.Parent then
+			pipTarget = resolveTarget(pipTargetName)
+			pipTargetName = pipTarget and pipTarget.Name or ""
+			refreshButton()
+		end
+		if not pipTarget then
+			label.Text = "no players"
+			return
+		end
+
+		frames = frames + 1
+		acc = acc + dt
+		if acc >= 0.5 then
+			fps = frames / acc
+			frames, acc = 0, 0
+		end
+
+		for plr, entry in pairs(mirrors) do
+			if not plr.Parent or not wantsMirror(plr) or entry.char ~= plr.Character then
+				dropMirror(entry)
+				mirrors[plr] = nil
+			end
+		end
+
+		local mirrored = 0
+		for _, plr in ipairs(Players:GetPlayers()) do
+			if wantsMirror(plr) then
+				bindPlayer(plr)
+				local char = plr.Character
+				local hrp = char and char:FindFirstChild("HumanoidRootPart")
+				if hrp then
+					local entry = mirrors[plr]
+					if not entry then
+						entry = makeMirror(char)
+						mirrors[plr] = entry
+					end
+					entry.clone:PivotTo(hrp.CFrame)
+					mirrored = mirrored + 1
+				end
+			end
+		end
+
+		appearAcc = appearAcc + dt
+		if appearAcc >= (1 / APPEAR_CHECK_HZ) then
+			appearAcc = 0
+			local now = os.clock()
+			for plr, entry in pairs(mirrors) do
+				if plr.Character == entry.char and now >= entry.nextAppearCheck then
+					entry.nextAppearCheck = now + 0.5
+					if attemptCount(plr, entry.char) < APPEAR_MAX_REBUILDS
+						and needsRebuild(entry.char, entry.clone) then
+						forceRebuild(plr)
+					end
+				end
+			end
+		end
+
+		animAcc = animAcc + dt
+		if animAcc >= (1 / ANIM_HZ) then
+			animAcc = 0
+			for plr, entry in pairs(mirrors) do
+				if plr.Character == entry.char then
+					syncAnimations(entry, entry.char)
+				end
+			end
+		end
+
+		local tchar = pipTarget.Character
+		local thrp = tchar and tchar:FindFirstChild("HumanoidRootPart")
+		if not thrp then
+			label.Text = pipTarget.Name .. " | no character"
+			return
+		end
+
+		-- PiP Autoturn: swing the view toward the last direction the target ran
+		-- forward. Sideways / backwards movement is ignored (dot < threshold).
+		if pipAutoturn then
+			local flat = Vector3.zero
+			local hum = tchar:FindFirstChildOfClass("Humanoid")
+			local md = hum and hum.MoveDirection or Vector3.zero
+			flat = Vector3.new(md.X, 0, md.Z)
+			if flat.Magnitude < 0.05 then
+				-- MoveDirection is not always replicated for other players; fall back
+				-- to the actual horizontal velocity while they are really moving.
+				local v = thrp.AssemblyLinearVelocity
+				flat = Vector3.new(v.X, 0, v.Z)
+				if flat.Magnitude < 8 then flat = Vector3.zero end
+			end
+			if flat.Magnitude > 0.05 then
+				flat = flat.Unit
+				local look = thrp.CFrame.LookVector
+				local lookFlat = Vector3.new(look.X, 0, look.Z)
+				if lookFlat.Magnitude > 0.01 and lookFlat.Unit:Dot(flat) > 0.35 then
+					pipAutoYaw = math.atan2(-flat.X, -flat.Z)
+				end
+			end
+			if pipAutoYaw then
+				local delta = (pipAutoYaw - yaw + math.pi) % (2 * math.pi) - math.pi
+				local step = AUTO_YAW_RATE * dt
+				yaw = yaw + math.clamp(delta, -step, step)
+			end
+		end
+
+		if worldFull then
+			if os.clock() - snapAt >= 10 then
+				snapAt = os.clock()
+				pcall(checkFullWorld)
+			end
+		else
+			local needSnap = snapCenter == nil
+			if not needSnap and (thrp.Position - snapCenter).Magnitude > SNAP_REFRESH_DIST then
+				needSnap = (os.clock() - snapAt) >= SNAP_MIN_INTERVAL
+			end
+			if needSnap then
+				pcall(snapshotWorld, thrp.Position, WORLD_RADIUS, WORLD_BUDGET)
+				snapCenter = thrp.Position
+				snapAt = os.clock()
+			end
+		end
+
+		local focus = thrp.Position + Vector3.new(0, LOOK_AT_Y, 0)
+		local cp = math.cos(pitch)
+		local dir = Vector3.new(math.sin(yaw) * cp, math.sin(pitch), math.cos(yaw) * cp)
+		cam.CFrame = CFrame.lookAt(focus + dir * camDist, focus)
+
+		label.Text = string.format("SPECTATING %s  |  %d chars  |  %.1f  |  %.0f fps",
+			pipTarget.Name, mirrored, camDist, fps)
+	end))
+end)()
 
 -- ====================== AUTOINFINITY ======================
 -- Loads PiggyHub/Database.json once, builds a whitelist of move-trigger anim
@@ -4554,7 +5662,14 @@ unloadScript = function()
 		end
 		_G.__SkinCleanup = nil
 	end
+	if pipCleanup then pcall(pipCleanup) end
 	if screenGui then screenGui:Destroy() end
+	-- Flush diagnostics before the stealth path clears the console, so the log
+	-- file still contains the final state if the user unloads to clear a latch.
+	pcall(function()
+		counterDiag("UNLOAD", counterDiagBlocking())
+		counterDiagFlush()
+	end)
 	-- stealth: restore SendNotification hook, wipe globals and attempt to clear console (no print left)
 	pcall(function()
 		if _G.__PiggyOrigSetCore then
@@ -5142,6 +6257,7 @@ local sharedM1AnimIds = {
 	["14272266117"] = true, ["14272296104"] = true,
 	["1470472673"] = true,
 }
+counterDiagSharedM1Ids = sharedM1AnimIds
 
 -- Fly hit-slow hook: stamp flySwingTime whenever WE start an M1 swing
 -- (verified live: swing anim plays, impact lands ~0.35s later, Super Dummy
@@ -5155,6 +6271,7 @@ local function hookFlySwing(char)
 	local anim = hum and hum:FindFirstChildOfClass("Animator")
 	if not anim then return end
 	flySwingConn = anim.AnimationPlayed:Connect(function(track)
+		counterDiagOnOwnAnim(track)
 		local aid = track.Animation and track.Animation.AnimationId
 		local num = aid and (tostring(aid):match("%d+")) or ""
 		if num ~= "" and sharedM1AnimIds[num] then
@@ -5186,7 +6303,11 @@ end
 
 local function checkShouldBlock()
 	if not autoBlockEnabled then return false end
-	if transitioningToCounter then return false end
+	if transitioningToCounter then
+		counterDiagThrottled("shouldBlockTransition", 1, "CHECK_BLOCK_SKIP",
+			"reason=transitioning", "counterGen=" .. tostring(counterGen))
+		return false
+	end
 	if os.clock() - lastCounterTime < counterLockoutDuration then return false end
 
 	-- Safety timeout: if blockingState is stuck, force clear it after 1s
@@ -5206,16 +6327,23 @@ local function checkShouldBlock()
 	local localAnimator = localHum:FindFirstChildOfClass("Animator")
 	local localTracks = localAnimator and localAnimator:GetPlayingAnimationTracks() or localHum:GetPlayingAnimationTracks()
 	local localIsSwinging = false
+	local localSwingName, localSwingId
 	for _, track in ipairs(localTracks) do
 		local name = track.Name:lower()
 		if string.find(name, "light") or string.find(name, "punch") or string.find(name, "atk") or string.find(name, "slash") or string.find(name, "swing") then
 			localIsSwinging = true
+			localSwingName = track.Name
+			localSwingId = track.Animation and track.Animation.AnimationId
 			break
 		end
 	end
 
 	if localIsSwinging then
+		local prev = lastLocalM1Time
 		lastLocalM1Time = os.clock()
+		counterDiagThrottled("localSwing", 0.5, "LOCAL_SWING_GUARD",
+			"name=" .. tostring(localSwingName), "id=" .. tostring(localSwingId),
+			string.format("sinceLastLocalM1=%.3f", os.clock() - prev))
 		return false
 	end
 
@@ -5283,6 +6411,10 @@ local function checkShouldBlock()
 
 if sharedM1AnimIds[animIdNum] then
 					table.insert(lastBlockedAnims, { Track = track, Time = os.clock() })
+					counterDiag("BLOCK_DETECT", "src=char", "player=" .. tostring(player.Name),
+						"name=" .. tostring(track.Name), "id=" .. tostring(animId),
+						string.format("dist=%.1f", dist), "blockTapDelay=" .. tostring(blockTapDelay),
+						"holdForCounter=" .. tostring(autoCounterEnabled and blockHoldForCounter or blockTapDuration))
 					return true, track
 				end
   	 	 	 	if not seenUnknownAnimIds[animIdNum] then
@@ -5307,6 +6439,10 @@ if sharedM1AnimIds[animIdNum] then
 							local snum = (tostring(sanimId):match("%d+")) or ""
 							if sharedM1AnimIds[snum] then
 								table.insert(lastBlockedAnims, { Track = track, Time = os.clock() })
+								counterDiag("BLOCK_DETECT", "src=stand", "player=" .. tostring(player.Name),
+									"name=" .. tostring(track.Name), "id=" .. tostring(sanimId),
+									string.format("dist=%.1f", dist), "blockTapDelay=" .. tostring(blockTapDelay),
+									"holdForCounter=" .. tostring(autoCounterEnabled and blockHoldForCounter or blockTapDuration))
 								return true, track
 							end
 						end
@@ -5316,7 +6452,11 @@ end
 end
 end
 
-local function triggerCounterM1()
+local function triggerCounterM1(tag)
+	counterDiag("M1_SEND", "src=" .. tostring(tag or "?"),
+		"counterGen=" .. tostring(counterGen),
+		"transitioning=" .. tostring(transitioningToCounter),
+		counterDiagBlocking())
 	local success, err = pcall(function()
 		local bp = LocalPlayer:FindFirstChild("Backpack")
 		local input = bp and bp:FindFirstChild("Input")
@@ -5324,6 +6464,7 @@ local function triggerCounterM1()
 			local char = LocalPlayer.Character
 			local root = char and char:FindFirstChild("HumanoidRootPart")
 			if root then
+			counterDiag("M1_PATH", "src=" .. tostring(tag or "?"), "path=input:FireServer")
 			input:FireServer("M1", {
 				air = false,
 				mousehit = root.CFrame,
@@ -5336,6 +6477,7 @@ local function triggerCounterM1()
 			end
 		end
 
+		counterDiag("M1_PATH", "src=" .. tostring(tag or "?"), "path=mouseFallback")
 		if mouse1click then
 			mouse1click()
 		else
@@ -5347,7 +6489,9 @@ local function triggerCounterM1()
 			end)
 		end
 	end)
-	if not success then do end
+	if not success then
+		counterDiag("M1_ERROR", "src=" .. tostring(tag or "?"), tostring(err))
+		do end
 		local mousePos = UserInputService:GetMouseLocation()
 		VirtualInputManager:SendMouseButtonEvent(mousePos.X, mousePos.Y, 0, true, game, 0)
 		task.spawn(function()
@@ -5363,6 +6507,9 @@ local function doParryTap(track)
 	local myGen = blockGen
 	blockingState = true
 	blockStartTime = os.clock()
+	counterDiag("PARRY_TAP_START", "gen=" .. tostring(myGen), "blockTapDelay=" .. tostring(blockTapDelay),
+		"hold=" .. tostring(autoCounterEnabled and blockHoldForCounter or blockTapDuration),
+		"track=" .. tostring(track and track.Name))
 
 	task.spawn(function()
 		if blockTapDelay > 0 then
@@ -5370,10 +6517,15 @@ local function doParryTap(track)
 		end
 
 		-- Stale tap: a newer tap owns the key now, touch nothing.
-		if myGen ~= blockGen then return end
+		if myGen ~= blockGen then
+			counterDiag("PARRY_TAP_STALE", "gen=" .. tostring(myGen), "blockGen=" .. tostring(blockGen))
+			return
+		end
 		-- Ensure we are still in blockingState and haven't transitioned to counter during the wait
 		if blockingState and not transitioningToCounter then
 			scriptFDown()
+			counterDiag("PARRY_TAP_DOWN", "gen=" .. tostring(myGen),
+				"hold=" .. tostring(autoCounterEnabled and blockHoldForCounter or blockTapDuration))
 			-- Balance flag: if a newer generation kills us after this point,
 			-- we MUST release our own press on the way out, otherwise the
 			-- game is left holding F with nobody owning it (stuck block that
@@ -5396,6 +6548,9 @@ local function doParryTap(track)
 			end
 
 			if myGen ~= blockGen then
+				counterDiag("PARRY_TAP_KILLED", "gen=" .. tostring(myGen), "blockGen=" .. tostring(blockGen),
+					"sentDown=" .. tostring(sentDown), "transitioning=" .. tostring(transitioningToCounter),
+					"userHoldingF=" .. tostring(userHoldingF))
 				if sentDown then
 					sentDown = false
 					scriptFUp()
@@ -5406,11 +6561,16 @@ local function doParryTap(track)
 				blockingState = false
 				if userHoldingF then
 					-- Finger took over mid-tap: cede the key, don't cut their hold.
+					counterDiag("PARRY_TAP_CEDE", "gen=" .. tostring(myGen), "userHoldingF=true")
 				else
+					counterDiag("PARRY_TAP_END", "gen=" .. tostring(myGen), "userHoldingF=false")
 					scriptFUp()
 				end
 			end
 		else
+			counterDiag("PARRY_TAP_ABORT", "gen=" .. tostring(myGen), "blockGen=" .. tostring(blockGen),
+				"blockingState=" .. tostring(blockingState),
+				"transitioning=" .. tostring(transitioningToCounter))
 			if myGen == blockGen then blockingState = false end
 		end
 	end)
@@ -5528,8 +6688,13 @@ end
 
 local function airSwingFire()
 	airSwingArmed = nil
-	if transitioningToCounter then return end
+	if transitioningToCounter then
+		counterDiag("AIR_FIRE_BLOCKED", "reason=transitioning", "counterGen=" .. tostring(counterGen))
+		return
+	end
 	transitioningToCounter = true
+	counterTransitionStart = os.clock()
+	counterTransitionWarned = false
 	counterGen = counterGen + 1
 	local myGen = counterGen
 	blockGen = blockGen + 1 -- invalidate any in-flight parry tap so it can't release this sequence
@@ -5538,31 +6703,63 @@ local function airSwingFire()
 	-- what used to resurrect stuck holds the user never asked for.
 	local wasUserHolding = userHoldingF
 	local hadScriptHold = blockingState
+	local transitionStarted = counterTransitionStart
+
+	counterDiag("TRANSITION_ON", "src=airswing", "gen=" .. tostring(myGen),
+		"counterM1Delay=" .. tostring(counterM1Delay),
+		"wasUserHolding=" .. tostring(wasUserHolding),
+		"hadScriptHold=" .. tostring(hadScriptHold), counterDiagBlocking())
 
 			-- Unblock/time/reblock mechanics only -- there is no impact trigger here.
 	-- The server eats M1s thrown while blocking, so F must be released for the
 	-- punish to exist at all, then re-pressed so a physical hold survives intact.
 	task.spawn(function()
-		pcall(function()
+		local ok, err = pcall(function()
 			blockingState = false
 			scriptFUp()
+			counterDiag("AIR_UNBLOCK", "gen=" .. tostring(myGen),
+				"counterM1Delay=" .. tostring(counterM1Delay))
 
 			-- Full Counter Delay, same as the block-impact path below: the Air
 			-- Swing Delay slider positioned the punish in their recovery, this
 			-- lets our block physics drop so the M1 isn't swallowed.
 			task.wait(counterM1Delay)
 
-			if myGen ~= counterGen then return end
-			triggerCounterM1()
+			if myGen ~= counterGen then
+				counterDiag("COUNTER_ABORT", "src=airswing", "gen=" .. tostring(myGen),
+					"counterGen=" .. tostring(counterGen), "leakRisk=true",
+					"transitioning=" .. tostring(transitioningToCounter), counterDiagBlocking())
+				return
+			end
+			counterDiagNoteM1Send("airswing")
+			triggerCounterM1("airswing")
 			task.wait(0.02)
-			if myGen ~= counterGen then return end
-			triggerCounterM1()
+			if myGen ~= counterGen then
+				counterDiag("COUNTER_ABORT", "src=airswing", "gen=" .. tostring(myGen),
+					"counterGen=" .. tostring(counterGen), "leakRisk=true",
+					"transitioning=" .. tostring(transitioningToCounter), counterDiagBlocking())
+				return
+			end
+			triggerCounterM1("airswing")
 			task.wait(0.05)
 		end)
-		if myGen ~= counterGen then return end
+		if not ok then
+			counterDiag("COUNTER_ERROR", "src=airswing", tostring(err))
+		end
+		if myGen ~= counterGen then
+			counterDiag("COUNTER_ABORT", "src=airswing", "gen=" .. tostring(myGen),
+				"counterGen=" .. tostring(counterGen), "leakRisk=true", "stage=post-task",
+				"transitioning=" .. tostring(transitioningToCounter), counterDiagBlocking())
+			return
+		end
 		transitioningToCounter = false
+		counterDiag("TRANSITION_OFF", "src=airswing", "gen=" .. tostring(myGen),
+			string.format("heldFor=%.3f", os.clock() - transitionStarted))
 
 		if wasUserHolding and userHoldingF then
+			counterDiag("REPRESS", "src=airswing", "reason=fingerStillDown",
+				"autoBlockEnabled=" .. tostring(autoBlockEnabled),
+				"hadScriptHold=" .. tostring(hadScriptHold))
 			scriptFDown()
 			if autoBlockEnabled then
 				blockingState = true
@@ -5572,9 +6769,17 @@ local function airSwingFire()
 			end
 		elseif hadScriptHold and autoBlockEnabled then
 			-- Resume script's own hold (no finger involved).
+			counterDiag("REPRESS", "src=airswing", "reason=hadScriptHold",
+				"releaseOwner=none", "autoBlockEnabled=true")
 			scriptFDown()
 			blockingState = true
 			blockStartTime = os.clock()
+		else
+			counterDiag("NO_REPRESS", "src=airswing",
+				"wasUserHolding=" .. tostring(wasUserHolding),
+				"userHoldingF=" .. tostring(userHoldingF),
+				"hadScriptHold=" .. tostring(hadScriptHold),
+				"autoBlockEnabled=" .. tostring(autoBlockEnabled))
 		end
 	end)
 end
@@ -5624,7 +6829,10 @@ local function setupGlobalCounterListener()
 
 	local function onBlockImpact()
 		do end
-		if not autoCounterEnabled then return end
+		if not autoCounterEnabled then
+			counterDiag("IMPACT_REJECT", "reason=autoCounterOff")
+			return
+		end
 		-- Use recent M1 detection cache (race condition fix): BlockSound can fire
 		-- after the M1 anim track is no longer enumerable, so isOpponentPlayingM1()
 		-- alone is unreliable. lastBlockedAnims is populated by checkShouldBlock.
@@ -5635,10 +6843,25 @@ local function setupGlobalCounterListener()
 			end
 		end
 		local hasRecentM1 = #lastBlockedAnims > 0
-		if not hasRecentM1 and not isOpponentPlayingM1() then return end
+		local playingM1 = nil
+		if not hasRecentM1 then playingM1 = isOpponentPlayingM1() end
+		counterDiag("IMPACT_EVAL", "recentM1=" .. tostring(hasRecentM1),
+			"recentCount=" .. tostring(#lastBlockedAnims),
+			"playingM1=" .. tostring(playingM1),
+			"transitioning=" .. tostring(transitioningToCounter),
+			"counterGen=" .. tostring(counterGen))
+		if not hasRecentM1 and not playingM1 then
+			counterDiag("IMPACT_REJECT", "reason=noM1")
+			return
+		end
 		
-		if transitioningToCounter then return end
+		if transitioningToCounter then
+			counterDiag("IMPACT_REJECT", "reason=transitioning", "counterGen=" .. tostring(counterGen))
+			return
+		end
 		transitioningToCounter = true
+		counterTransitionStart = os.clock()
+		counterTransitionWarned = false
 		counterGen = counterGen + 1
 		local myGen = counterGen
 		blockGen = blockGen + 1 -- invalidate any in-flight parry tap so it can't release this sequence
@@ -5648,6 +6871,12 @@ local function setupGlobalCounterListener()
 		-- parry hold, which used to re-apply a hold after the counter even when
 		-- the user had already let go -> stuck block.
 		local wasUserHolding = userHoldingF
+		local transitionStarted = counterTransitionStart
+		local blockingStateBefore = blockingState
+		counterDiag("TRANSITION_ON", "src=impact", "gen=" .. tostring(myGen),
+			"counterM1Delay=" .. tostring(counterM1Delay),
+			"wasUserHolding=" .. tostring(wasUserHolding),
+			"blockingStateBefore=" .. tostring(blockingStateBefore), counterDiagBlocking())
 		
 		lastCounterTime = os.clock() -- Lockout AutoBlock IMMEDIATELY on hit!
 		
@@ -5658,41 +6887,73 @@ local function setupGlobalCounterListener()
 				
 				-- Release F key IMMEDIATELY to exit block state instantly
 				scriptFUp()
+				counterDiag("IMPACT_UNBLOCK", "gen=" .. tostring(myGen),
+					"counterM1Delay=" .. tostring(counterM1Delay))
 				do end
 				
 				-- Wait counterM1Delay to let block physics drop (tunable via Counter Delay slider)
 				task.wait(counterM1Delay)
 
-				if myGen ~= counterGen then return end
+				if myGen ~= counterGen then
+					counterDiag("COUNTER_ABORT", "src=impact", "gen=" .. tostring(myGen),
+						"counterGen=" .. tostring(counterGen), "leakRisk=true",
+						"transitioning=" .. tostring(transitioningToCounter), counterDiagBlocking())
+					return
+				end
 				
 				do end
-				triggerCounterM1()
+				counterDiagNoteM1Send("impact")
+				triggerCounterM1("impact")
 				task.wait(0.02)
-				if myGen ~= counterGen then return end
-				triggerCounterM1()
+				if myGen ~= counterGen then
+					counterDiag("COUNTER_ABORT", "src=impact", "gen=" .. tostring(myGen),
+						"counterGen=" .. tostring(counterGen), "leakRisk=true",
+						"transitioning=" .. tostring(transitioningToCounter), counterDiagBlocking())
+					return
+				end
+				triggerCounterM1("impact")
 				
 				task.wait(0.05)
 			end)
-			if myGen ~= counterGen then return end
-			if not success then do end
+			if myGen ~= counterGen then
+				counterDiag("COUNTER_ABORT", "src=impact", "gen=" .. tostring(myGen),
+					"counterGen=" .. tostring(counterGen), "leakRisk=true", "stage=post-task",
+					"transitioning=" .. tostring(transitioningToCounter), counterDiagBlocking())
+				return
+			end
+			if not success then
+				counterDiag("COUNTER_ERROR", "src=impact", tostring(err))
+				do end
 				blockingState = false
 				scriptFUp()
 			end
 			transitioningToCounter = false
+			counterDiag("TRANSITION_OFF", "src=impact", "gen=" .. tostring(myGen),
+				string.format("heldFor=%.3f", os.clock() - transitionStarted))
 
 			-- Re-apply block after the counter only if the finger is still down,
 			-- so holding F the whole time keeps blocking after the counter M1.
 			if wasUserHolding and userHoldingF then
+				counterDiag("REPRESS", "src=impact", "reason=fingerStillDown",
+					"autoBlockEnabled=" .. tostring(autoBlockEnabled))
 				blockingState = true
 				blockStartTime = os.clock()
 				scriptFDown()
 				do end
+			else
+				counterDiag("NO_REPRESS", "src=impact",
+					"wasUserHolding=" .. tostring(wasUserHolding),
+					"userHoldingF=" .. tostring(userHoldingF))
 			end
 		end)
 	end
 
 	local function bindSound(sound)
-		local conn1 = sound.Played:Connect(onBlockImpact)
+		local conn1 = sound.Played:Connect(function()
+			counterDiag("BLOCK_SOUND", "name=" .. tostring(sound.Name),
+				"parent=" .. tostring(sound.Parent and sound.Parent.Name))
+			onBlockImpact()
+		end)
 		table.insert(connections, conn1)
 	end
 
@@ -5723,6 +6984,32 @@ end
 table.insert(connections, LocalPlayer.CharacterAdded:Connect(function()
 	task.wait(0.5)
 	setupGlobalCounterListener()
+end))
+
+-- Diagnostic watchdog: catches the "transitioningToCounter got latched" failure.
+-- A healthy counter clears well under 0.5s (max slider + fixed 0.07s tail).
+local counterDiagNextFileFlush = 0
+table.insert(connections, RunService.Heartbeat:Connect(function()
+	local nowClock = os.clock()
+	if nowClock >= counterDiagNextFileFlush then
+		counterDiagNextFileFlush = nowClock + 0.5
+		counterDiagFlush()
+	end
+	if not transitioningToCounter then
+		counterTransitionWarned = false
+		return
+	end
+	local elapsed = os.clock() - counterTransitionStart
+	if elapsed > 0.5 and not counterTransitionWarned then
+		counterTransitionWarned = true
+		counterDiag("TRANSITION_STUCK", string.format("elapsed=%.3f", elapsed),
+			"counterGen=" .. tostring(counterGen),
+			"lastCounterAge=" .. string.format("%.3f", os.clock() - lastCounterTime),
+			counterDiagBlocking())
+		if counterDiagEnv.PiggyCounterPrint then
+			warn(string.format("[CDIAG] transitioningToCounter has been true for %.2fs - counter state is latched. Re-execute the script to clear it.", elapsed))
+		end
+	end
 end))
 
 -- ====================== SYSTEM CONNECTIONS ======================
@@ -6374,8 +7661,20 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 	end
 	-- A counter is mid-flight (ours just fired, or impact cleared the arm):
 	-- wait it out WITHOUT dropping the arm; staleness rules below decide
-	if transitioningToCounter then return end
-	if os.clock() - lastCounterTime < counterLockoutDuration then return end
+	if transitioningToCounter then
+		if counterDiagEnv.PiggyCounterVerbose then
+			counterDiagThrottled("airTransition", 1, "AIR_SKIP", "reason=transitioning",
+				"counterGen=" .. tostring(counterGen))
+		end
+		return
+	end
+	if os.clock() - lastCounterTime < counterLockoutDuration then
+		if counterDiagEnv.PiggyCounterVerbose then
+			counterDiagThrottled("airLockout", 1, "AIR_SKIP", "reason=counterLockout",
+				string.format("age=%.3f", os.clock() - lastCounterTime))
+		end
+		return
+	end
 	local now = os.clock()
 
 	local localChar = LocalPlayer.Character
@@ -6398,6 +7697,8 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 		local armed = airSwingArmed
 		local root = armed.root
 		if not root or not root.Parent or (now - armed.t0) > AIR_SWING_TIMEOUT then
+			counterDiag("AIR_DROP", "reason=rootGoneOrTimeout",
+				string.format("age=%.3f", now - armed.t0), "timeout=" .. tostring(AIR_SWING_TIMEOUT))
 			airSwingArmed = nil -- enemy gone / stale: nothing spent, nothing touched
 			return
 		end
@@ -6405,18 +7706,35 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 		if (now - armed.t0) < airSwingDelay then return end
 		-- Too stale to punish cleanly (kept missing its window): drop it
 		if (now - armed.t0) > airSwingDelay + AIR_SWING_MAX_LATE then
+			counterDiag("AIR_DROP", "reason=tooStale",
+				string.format("age=%.3f", now - armed.t0),
+				"delay=" .. tostring(airSwingDelay),
+				"maxLate=" .. tostring(AIR_SWING_MAX_LATE))
 			airSwingArmed = nil
 			return
 		end
 		-- Cooldown active: hold the arm and retry next frame, don't burn the track
-		if now - lastAirSwingTime < airSwingCooldown then return end
+		if now - lastAirSwingTime < airSwingCooldown then
+			if counterDiagEnv.PiggyCounterVerbose then
+				counterDiagThrottled("airCooldown", 1, "AIR_SKIP", "reason=airSwingCooldown",
+					string.format("age=%.3f", now - lastAirSwingTime))
+			end
+			return
+		end
 		local dist = (root.Position - localHrp.Position).Magnitude
 		if dist > swingRange then
+			counterDiag("AIR_DROP", "reason=outOfRange",
+				string.format("dist=%.1f", dist), "range=" .. tostring(swingRange))
 			airSwingArmed = nil -- out of Swing Range: don't whiff
 			return
 		end
 		-- Deliberately no block yield: a real impact already won the race above
 		-- (transitioningToCounter), so this swing whiffed -- punish it even held.
+		counterDiag("AIR_FIRE", string.format("age=%.3f", now - armed.t0),
+			"delay=" .. tostring(airSwingDelay),
+			"counterM1Delay=" .. tostring(counterM1Delay),
+			string.format("dist=%.1f", dist),
+			"autoBlockEnabled=" .. tostring(autoBlockEnabled))
 		lastAirSwingTime = now
 		airSwingArmed = nil
 		airSwingFire()
@@ -6424,24 +7742,48 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 	end
 
 	-- Not armed: cooldown gate, then look for a fresh enemy swing
-	if now - lastAirSwingTime < airSwingCooldown then return end
+	if now - lastAirSwingTime < airSwingCooldown then
+		if counterDiagEnv.PiggyCounterVerbose then
+			counterDiagThrottled("airCooldownIdle", 1, "AIR_SKIP", "reason=airSwingCooldown",
+				string.format("age=%.3f", now - lastAirSwingTime))
+		end
+		return
+	end
 
 	-- Only answer swings fired while WE are holding block. If our own M1 is
 	-- still going (key up, no block live), let this one pass untouched until
 	-- we're blocking again -- nothing is consumed, so it re-evaluates then.
-	if not isAirSwingHolding() then return end
+	if not isAirSwingHolding() then
+		if counterDiagEnv.PiggyCounterVerbose then
+			counterDiagThrottled("airNotHolding", 1, "AIR_SKIP", "reason=notHoldingBlock")
+		end
+		return
+	end
 
 	-- Don't block-cancel our own attack to chase a punish
 	local localAnimator = localHum:FindFirstChildOfClass("Animator")
 	local localTracks = localAnimator and localAnimator:GetPlayingAnimationTracks() or localHum:GetPlayingAnimationTracks()
+	local localSwingName, localSwingId
 	for _, t in ipairs(localTracks) do
 		local n = t.Name:lower()
 		if string.find(n, "light") or string.find(n, "punch") or string.find(n, "atk") or string.find(n, "slash") or string.find(n, "swing") then
+			localSwingName = t.Name
+			localSwingId = t.Animation and t.Animation.AnimationId
+			local prevLocalM1 = lastLocalM1Time
 			lastLocalM1Time = now
+			counterDiagThrottled("airSelfSwing", 0.5, "AIR_SKIP", "reason=ownSwing",
+				"name=" .. tostring(localSwingName), "id=" .. tostring(localSwingId),
+				string.format("sinceLastLocalM1=%.3f", now - prevLocalM1))
 			return
 		end
 	end
-	if now - lastLocalM1Time < AIR_SWING_SELF_GUARD then return end
+	if now - lastLocalM1Time < AIR_SWING_SELF_GUARD then
+		if counterDiagEnv.PiggyCounterVerbose then
+			counterDiagThrottled("airSelfGuard", 1, "AIR_SKIP", "reason=selfGuard",
+				string.format("age=%.3f", now - lastLocalM1Time))
+		end
+		return
+	end
 
 	local track, enemyRoot = findAirSwingTarget(localHrp)
 	if enemyRoot then
@@ -6470,6 +7812,24 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 				root = enemyRoot,
 				t0 = now - startOffset,
 			}
+			counterDiag("AIR_ARM", "name=" .. tostring(track and track.Name),
+				"id=" .. tostring(track and track.Animation and track.Animation.AnimationId),
+				string.format("startOffset=%.3f", startOffset),
+				"delay=" .. tostring(airSwingDelay),
+				"t0=" .. string.format("%.3f", now - startOffset),
+				"root=" .. tostring(enemyRoot and enemyRoot.Parent and enemyRoot.Parent.Name),
+				"range=" .. tostring(swingRange))
+		else
+			counterDiagThrottled("airStale", 0.5, "AIR_REJECT_STALE",
+				"reason=startOffsetTooOld",
+				"name=" .. tostring(track and track.Name),
+				"id=" .. tostring(track and track.Animation and track.Animation.AnimationId),
+				string.format("startOffset=%.3f", startOffset),
+				"freshWindow=" .. tostring(AIR_SWING_FRESH_WINDOW))
+		end
+	else
+		if counterDiagEnv.PiggyCounterVerbose then
+			counterDiagThrottled("airNoTarget", 1, "AIR_SKIP", "reason=noTarget")
 		end
 	end
 end))
