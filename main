@@ -1,8 +1,8 @@
 -- STEALTH PATCH: silent mode - no console output, no traces on unload
 -- (all print/warn calls rewritten to do end below)
 -- original boot print removed
--- EXCEPTION: the COUNTER DIAGNOSTICS block below prints to the local console
--- unless getgenv().PiggyCounterPrint = false (file logging stays available).
+-- The COUNTER DIAGNOSTICS block is OFF by default; set
+-- getgenv().PiggyCounterOptIn = true before executing to trace again.
 do -- stealth: suppress SendNotification popups (no visual trace)
     pcall(function()
         local sg = game:GetService("StarterGui")
@@ -175,11 +175,18 @@ local moveEspSize = 2.4
 local targetEspEnabled = true
 local targetEspBillboard = nil
 local targetEspAlertTime = 0
--- Player PiP (viewport spectator): master switch + selected target
-local pipEnabled = false
-local pipAutoturn = false
-local pipTargetName = ""
-local pipSetEnabled, pipSetTarget -- forward: assigned by the Player PiP block
+-- Player PiP (viewport spectator): all of its settings live in one table so the
+-- main chunk does not run out of local registers (Luau caps at 200).
+local pipCfg = {
+	enabled = false,
+	autoturn = false,
+	enemyLock = false,
+	winW = 300,
+	winH = 169,
+	target = "",
+	setEnabled = nil, -- forward: assigned by the Player PiP block
+	setTarget = nil, -- forward: assigned by the Player PiP block
+}
 local pipCleanup -- forward: assigned by the Player PiP block (unload)
 local gojoAfterimageEnabled = false
 local gojoBlueActive = false
@@ -200,21 +207,27 @@ local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
 -- ====================== COUNTER DIAGNOSTICS ======================
 -- Behaviour-neutral tracing for Auto Block / Auto Counter / Air Swing.
--- Toggle at runtime:
---   getgenv().PiggyCounterDiagOn = false   -- stop logging
---   getgenv().PiggyCounterFile = false     -- no file output
---   getgenv().PiggyCounterPrint = false    -- keep stealth console silent
+-- Silent by default: no console prints, no file writes, no ring buffer.
+-- To trace again, set getgenv().PiggyCounterOptIn = true BEFORE executing.
+-- Runtime toggles still work:
+--   getgenv().PiggyCounterDiagOn = true    -- start/stop collecting
+--   getgenv().PiggyCounterFile = true      -- file output
+--   getgenv().PiggyCounterPrint = true     -- console output
 --   getgenv().PiggyCounterVerbose = true   -- per-frame/guard spam
 -- Dump the ring buffer: getgenv().PiggyCounterDump(200)
 -- Clear it:             getgenv().PiggyCounterClear()
--- File (when the executor supports appendfile): PiggyHub/counter_diag.log
+-- File (when enabled and the executor supports appendfile): PiggyHub/counter_diag.log
 local counterDiagEnv = _G
 pcall(function()
 	if typeof(getgenv) == "function" and getgenv() then counterDiagEnv = getgenv() end
 end)
-if counterDiagEnv.PiggyCounterDiagOn == nil then counterDiagEnv.PiggyCounterDiagOn = true end
-if counterDiagEnv.PiggyCounterFile == nil then counterDiagEnv.PiggyCounterFile = true end
-if counterDiagEnv.PiggyCounterPrint == nil then counterDiagEnv.PiggyCounterPrint = true end
+-- Force everything off unless the user opted in for this run. The old code only
+-- filled these in when nil, so a `true` left behind by a previous execution kept
+-- the console spamming forever.
+local counterDiagOptIn = counterDiagEnv.PiggyCounterOptIn == true
+counterDiagEnv.PiggyCounterDiagOn = counterDiagOptIn
+counterDiagEnv.PiggyCounterFile = counterDiagOptIn
+counterDiagEnv.PiggyCounterPrint = counterDiagOptIn
 if counterDiagEnv.PiggyCounterVerbose == nil then counterDiagEnv.PiggyCounterVerbose = false end
 
 local counterDiagEntries = {}
@@ -837,7 +850,7 @@ espTabFrame.Position = UDim2.new(0, 140, 0, 10)
 espTabFrame.BackgroundTransparency = 1
 espTabFrame.Visible = false
 espTabFrame.Parent = bodyFrame
-espTabFrame.CanvasSize = UDim2.new(0, 0, 0, 512)
+espTabFrame.CanvasSize = UDim2.new(0, 0, 0, 560)
 espTabFrame.ScrollBarThickness = 6
 espTabFrame.ScrollBarImageColor3 = Color3.fromRGB(80, 80, 95)
 espTabFrame.ScrollingDirection = Enum.ScrollingDirection.Y
@@ -1741,9 +1754,12 @@ function ConfigManager.collectSettings()
 		targetEspEnabled = targetEspEnabled,
 		targetEspSensitivity = targetEspSensitivity,
 		targetEspRange = targetEspRange,
-		pipEnabled = pipEnabled,
-		pipAutoturn = pipAutoturn,
-		pipTargetName = pipTargetName,
+		pipEnabled = pipCfg.enabled,
+		pipAutoturn = pipCfg.autoturn,
+		pipEnemyLock = pipCfg.enemyLock,
+		pipWinW = pipCfg.winW,
+		pipWinH = pipCfg.winH,
+		pipTargetName = pipCfg.target,
 	}
 end
 
@@ -1872,9 +1888,13 @@ function ConfigManager.load(name)
 	targetEspEnabled = data.targetEspEnabled or false
 	targetEspSensitivity = data.targetEspSensitivity or 0.25
 	targetEspRange = data.targetEspRange or 180
-	pipEnabled = data.pipEnabled == true
-	pipAutoturn = data.pipAutoturn == true
-	pipTargetName = data.pipTargetName or ""
+	pipCfg.enabled = data.pipEnabled == true
+	pipCfg.autoturn = data.pipAutoturn == true
+	pipCfg.enemyLock = data.pipEnemyLock == true
+	if pipCfg.autoturn and pipCfg.enemyLock then pipCfg.autoturn = false end -- only one turn mode at a time
+	pipCfg.winW = math.clamp(tonumber(data.pipWinW) or 300, 180, 1400)
+	pipCfg.winH = math.clamp(tonumber(data.pipWinH) or 169, 110, 900)
+	pipCfg.target = data.pipTargetName or ""
 	autoInfinityLookSensitivity = data.autoInfinityLookSensitivity or 0.5
 	autoInfinityRayRadius = data.autoInfinityRayRadius or 40
 	
@@ -1932,10 +1952,11 @@ function ConfigManager.load(name)
 	if settingsRefs.ultEspSize then settingsRefs.ultEspSize.Set(ultEspSize) end
 	if settingsRefs.moveEspSize then settingsRefs.moveEspSize.Set(moveEspSize) end
 	-- Player PiP: restore the saved target first, then the switch
-	if pipSetTarget and pipTargetName ~= "" then pcall(pipSetTarget, pipTargetName) end
-	if settingsRefs.pipEnabled then settingsRefs.pipEnabled.Set(pipEnabled) end
-	if settingsRefs.pipAutoturn then settingsRefs.pipAutoturn.Set(pipAutoturn) end
-	if pipSetEnabled then pcall(pipSetEnabled, pipEnabled) end
+	if pipCfg.setTarget and pipCfg.target ~= "" then pcall(pipCfg.setTarget, pipCfg.target) end
+	if settingsRefs.pipEnabled then settingsRefs.pipEnabled.Set(pipCfg.enabled) end
+	if settingsRefs.pipAutoturn then settingsRefs.pipAutoturn.Set(pipCfg.autoturn) end
+	if settingsRefs.pipEnemyLock then settingsRefs.pipEnemyLock.Set(pipCfg.enemyLock) end
+	if pipCfg.setEnabled then pcall(pipCfg.setEnabled, pipCfg.enabled) end
 updateCounterLabel()
 	updateInfinityLabel()
 end)
@@ -2949,7 +2970,9 @@ end)
 	local UIS = UserInputService
 	local RS = RunService
 
-	local WINDOW_W, WINDOW_H = 300, 169
+	local WINDOW_W, WINDOW_H = pipCfg.winW, pipCfg.winH
+	local MIN_WIN_W, MIN_WIN_H = 180, 110
+	local RESIZE_GRIP = 20
 	local MARGIN, TOP_SAFE = 18, 58
 	local CAM_DIST_MIN, CAM_DIST_MAX = 3.5, 45
 	local ORBIT_SENS, ZOOM_STEP = 0.007, 0.12
@@ -2960,7 +2983,9 @@ end)
 	local ANIM_HZ, ANIM_DRIFT = 15, 0.10
 	local APPEAR_CHECK_HZ, APPEAR_MAX_REBUILDS = 2, 4
 	local MIRROR_NEARBY_DIST = 90
-	local AUTO_YAW_RATE = 5.0 -- rad/s the PiP view swings toward the target's run direction
+	local AUTO_YAW_RATE = 9.0 -- rad/s the PiP view swings toward the target's run direction / locked enemy
+	local ENEMY_RANGE = 300 -- studs, max distance for the enemy lock
+	local ENEMY_SCAN_HZ = 10 -- enemy re-scan rate
 	local DEFAULT_GREY = Color3.fromRGB(163, 162, 165)
 
 	-- drop a window left behind by an earlier run of this file / the prototype
@@ -2977,14 +3002,19 @@ end)
 	local camDist = 12
 	local yaw, pitch = 0, math.rad(22)
 	local pipAutoYaw = nil -- last forward-run heading (radians) the view swings to
+	local pipEnemy = nil -- Player the enemy lock is currently watching
+	local pipEnemyYaw = nil -- heading (radians) toward that enemy
+	local pipEnemyDist = 0
+	local enemyAcc = 0
 	local mirrors, attempts, playerConns = {}, {}, {}
 	local snapCenter, snapAt = nil, 0
 	local worldFull = false
 	local mapPartCount = 0
+	local rebuilding, scanBusy = false, false
 	local animAcc, appearAcc = 0, 0
 	local fps, frames, acc = 0, 0, 0
 	local placed = false
-	local dragMode, dragStart, dragOrigin
+	local dragMode, dragStart, dragOrigin, resizeStart
 
 	-- forward handles (assigned below, called by the tab controls / unload)
 	local applyEnabled, refreshButton, refreshPlayerList, setTarget
@@ -3041,6 +3071,27 @@ end)
 	label.TextStrokeTransparency = 0.4
 	label.Text = "Player PiP"
 	label.Parent = holder
+
+	-- resize grip (bottom-right corner): the input itself is handled by the
+	-- holder's InputBegan corner test, these bars are just the visual hint.
+	do
+		local g1 = Instance.new("Frame")
+		g1.Size = UDim2.fromOffset(13, 2)
+		g1.Position = UDim2.new(1, -16, 1, -6)
+		g1.BackgroundColor3 = Color3.new(1, 1, 1)
+		g1.BackgroundTransparency = 0.55
+		g1.BorderSizePixel = 0
+		g1.Parent = holder
+		local g2 = g1:Clone()
+		g2.Size = UDim2.fromOffset(2, 13)
+		g2.Position = UDim2.new(1, -6, 1, -16)
+		g2.Parent = holder
+		local g3 = g2:Clone()
+		g3.Size = UDim2.fromOffset(9, 2)
+		g3.Position = UDim2.new(1, -12, 1, -11)
+		g3.Rotation = -45
+		g3.Parent = holder
+	end
 
 	-- input ----------------------------------------------------------------
 	local mouseLocked = false
@@ -3099,14 +3150,23 @@ end)
 	end
 
 	local function endDrag()
+		local wasResize = dragMode == "resize"
 		dragMode = nil
 		unlockMouse()
+		if wasResize then autoSaveSettings() end
 	end
 
 	table.insert(connections, holder.InputBegan:Connect(function(input)
 		if not isDragInput(input) then return end
 		dragOrigin = holder.Position
-		if pointInEdge(input) then
+		local localPos = Vector2.new(input.Position.X, input.Position.Y) - holder.AbsolutePosition
+		local size = holder.AbsoluteSize
+		if localPos.X >= size.X - RESIZE_GRIP and localPos.Y >= size.Y - RESIZE_GRIP then
+			unlockMouse()
+			dragMode = "resize"
+			dragStart = UIS:GetMouseLocation()
+			resizeStart = size
+		elseif pointInEdge(input) then
 			unlockMouse()
 			dragMode = "move"
 			dragStart = UIS:GetMouseLocation()
@@ -3144,6 +3204,16 @@ end)
 			nx = math.clamp(nx, -WINDOW_W + 40, math.max(-WINDOW_W + 40, viewport.X - 40))
 			ny = math.clamp(ny, -WINDOW_H + 40, math.max(-WINDOW_H + 40, viewport.Y - 40))
 			holder.Position = UDim2.fromOffset(math.floor(nx), math.floor(ny))
+		elseif dragMode == "resize" then
+			local viewport = gui.AbsoluteSize
+			local delta = now - dragStart
+			local maxW = math.max(MIN_WIN_W, viewport.X - math.max(holder.Position.X.Offset, 0))
+			local maxH = math.max(MIN_WIN_H, viewport.Y - math.max(holder.Position.Y.Offset, 0))
+			local w = math.clamp(resizeStart.X + delta.X, MIN_WIN_W, maxW)
+			local h = math.clamp(resizeStart.Y + delta.Y, MIN_WIN_H, maxH)
+			WINDOW_W, WINDOW_H = math.floor(w), math.floor(h)
+			pipCfg.winW, pipCfg.winH = WINDOW_W, WINDOW_H
+			holder.Size = UDim2.fromOffset(WINDOW_W, WINDOW_H)
 		else
 			-- cursor is pinned, only relative motion is available
 			if not mouseLocked then lockMouse() end
@@ -3300,6 +3370,40 @@ end)
 		return list
 	end
 
+	-- Chunked workspace scan: same result as collectStaticParts but it yields to
+	-- the scheduler every ~0.6 ms, so scanning a big place never stalls a frame.
+	-- Whole subtrees (player characters, accessories, tools) are skipped up front
+	-- instead of walking every part's ancestor chain.
+	local function walkWorkspace(onPart)
+		-- one walk at a time: a rebuild must never read a half-finished scan
+		while scanBusy do task.wait() end
+		scanBusy = true
+		local ok = pcall(function()
+			local stack = { workspace }
+			local budget = 0.0006
+			while #stack > 0 do
+				local frameStart = os.clock()
+				repeat
+					local node = table.remove(stack)
+					local skip = node:IsA("Accessory") or node:IsA("Tool")
+						or (node:IsA("Model") and Players:GetPlayerFromCharacter(node) ~= nil)
+					if not skip then
+						for _, ch in ipairs(node:GetChildren()) do
+							if ch:IsA("BasePart") then
+								if ch.Transparency < 1 then onPart(ch) end
+							else
+								stack[#stack + 1] = ch
+							end
+						end
+					end
+				until #stack == 0 or (os.clock() - frameStart) >= budget
+				if #stack > 0 then task.wait() end
+			end
+		end)
+		scanBusy = false
+		return ok
+	end
+
 	local function commitSnapshot(snap)
 		local previous = {}
 		for _, ch in ipairs(world:GetChildren()) do
@@ -3307,7 +3411,20 @@ end)
 		end
 		snap.Name = "__worldsnap"
 		snap.Parent = world
-		for _, ch in ipairs(previous) do pcall(function() ch:Destroy() end) end
+		if #previous == 0 then return end
+		-- take the old islands out of the render list at once, then free their
+		-- instances in small slices so the destroy does not cost a frame
+		for _, ch in ipairs(previous) do pcall(function() ch.Parent = nil end) end
+		task.spawn(function()
+			for _, ch in ipairs(previous) do
+				local kids = ch:GetChildren()
+				for j = 1, #kids do
+					pcall(function() kids[j]:Destroy() end)
+					if j % 60 == 0 then task.wait() end
+				end
+				pcall(function() ch:Destroy() end)
+			end
+		end)
 	end
 
 	local function cloneInto(snap, list)
@@ -3324,53 +3441,68 @@ end)
 		return n
 	end
 
-	local function addGroundPlane(snap, center, radius)
-		for _, c in ipairs(snap:GetChildren()) do
-			if c:IsA("BasePart") then
-				local dx = math.abs(c.Position.X - center.X)
-				local dz = math.abs(c.Position.Z - center.Z)
-				if dx < 16 and dz < 16 and c.Position.Y <= center.Y + 1 then return end
-			end
-		end
-		local plane = Instance.new("Part")
-		plane.Anchored = true
-		plane.CanCollide = false
-		plane.Size = Vector3.new(radius * 2, 1, radius * 2)
-		plane.Position = center - Vector3.new(0, 3, 0)
-		plane.Color = Color3.fromRGB(175, 176, 184)
-		plane.Material = Enum.Material.SmoothPlastic
-		plane.TopSurface = Enum.SurfaceType.Smooth
-		plane.BottomSurface = Enum.SurfaceType.Smooth
-		plane.Parent = snap
-	end
+	-- NOTE: no synthetic ground plane. One used to be added under the target,
+	-- which meant a rebuild while they were airborne dropped a huge grey slab at
+	-- that altitude and hid the real geometry once they landed. Only real map
+	-- parts are mirrored now.
 
 	-- Whole-map mirror: if the map fits the budget it is cloned once, so the PiP
-	-- never shows a floating island that lags behind the target. Chunked across
-	-- frames so enabling the toggle does not freeze the client.
+	-- never shows a floating island that lags behind the target. Both the scan and
+	-- the clone run on a per-frame time budget, so a map reload costs at most a
+	-- couple of milliseconds per frame instead of a visible freeze.
 	local function buildFullWorld()
-		local list = collectStaticParts()
-		if #list > WORLD_FULL_BUDGET then return false end
+		if rebuilding then return true end
+		rebuilding = true
 		worldFull = true
-		mapPartCount = #list
 		snapAt = os.clock()
-		local snap = Instance.new("Model")
 		task.spawn(function()
-			for i = 1, #list, 150 do
-				for j = i, math.min(i + 149, #list) do
-					local ok, c = pcall(function() return list[j]:Clone() end)
+			local list = {}
+			local complete = walkWorkspace(function(part) list[#list + 1] = part end)
+			if not complete or not pipCfg.enabled or not worldFull then
+				rebuilding = false
+				if not complete then
+					-- fall back to the radius patch instead of showing an empty world
+					worldFull = false
+					snapCenter = nil
+					mapPartCount = 0
+				end
+				return
+			end
+			if #list > WORLD_FULL_BUDGET then
+				-- too big for a full mirror: let the radius fallback take over
+				rebuilding = false
+				worldFull = false
+				mapPartCount = 0
+				snapCenter = nil
+				return
+			end
+			mapPartCount = #list
+			local snap = Instance.new("Model")
+			local i = 1
+			while i <= #list do
+				local frameStart = os.clock()
+				repeat
+					local ok, c = pcall(function() return list[i]:Clone() end)
 					if ok and c then
 						c.Anchored = true
 						c.CanCollide = false
 						c.Parent = snap
 					end
-				end
+					i = i + 1
+				until i > #list or (os.clock() - frameStart) >= 0.002
 				task.wait()
-				if not pipEnabled or not worldFull then
+				if not pipCfg.enabled or not worldFull then
 					pcall(function() snap:Destroy() end)
+					rebuilding = false
+					-- the snapshot was cleared while we were building (PiP toggled
+					-- off/on, or a map swap): start over if it is still wanted
+					if pipCfg.enabled and not worldFull then task.defer(buildFullWorld) end
 					return
 				end
 			end
 			commitSnapshot(snap)
+			snapAt = os.clock()
+			rebuilding = false
 		end)
 		return true
 	end
@@ -3388,7 +3520,6 @@ end)
 		for i = 1, math.min(budget, #cand) do list[i] = cand[i].part end
 		local snap = Instance.new("Model")
 		local n = cloneInto(snap, list)
-		addGroundPlane(snap, center, radius)
 		commitSnapshot(snap)
 		worldFull = false
 		mapPartCount = n
@@ -3396,14 +3527,15 @@ end)
 	end
 
 	local function checkFullWorld()
-		if not pipEnabled or not worldFull then return end
-		local count = 0
-		for _, d in ipairs(workspace:GetDescendants()) do
-			if d:IsA("BasePart") then count = count + 1 end
-		end
-		if math.abs(count - mapPartCount) > math.max(30, mapPartCount * 0.05) then
-			buildFullWorld()
-		end
+		if not pipCfg.enabled or not worldFull or rebuilding or scanBusy then return end
+		task.spawn(function()
+			local count = 0
+			walkWorkspace(function() count = count + 1 end)
+			if not pipCfg.enabled or not worldFull or rebuilding then return end
+			if math.abs(count - mapPartCount) > math.max(30, mapPartCount * 0.05) then
+				buildFullWorld()
+			end
+		end)
 	end
 
 	local function attemptCount(plr, char)
@@ -3465,6 +3597,37 @@ end)
 		return (hrc.Position - thrp.Position).Magnitude <= MIRROR_NEARBY_DIST
 	end
 
+	local function pipIsTeammate(plr)
+		if plr == LocalPlayer then return true end
+		if not LocalPlayer.Team or not plr.Team then
+			return LocalPlayer.TeamColor == plr.TeamColor
+		end
+		return LocalPlayer.Team == plr.Team or LocalPlayer.TeamColor == plr.TeamColor
+	end
+
+	-- Nearest living player to the spectated character that we would consider an
+	-- enemy. With Team Check off every player counts (FFA places rarely set teams).
+	local function scanEnemies(originPos)
+		local bestPlr, bestDist = nil, ENEMY_RANGE
+		for _, plr in ipairs(Players:GetPlayers()) do
+			if plr ~= pipTarget and plr ~= LocalPlayer then
+				local char = plr.Character
+				local hum = char and char:FindFirstChildOfClass("Humanoid")
+				local hrp = char and char:FindFirstChild("HumanoidRootPart")
+				if hum and hrp and hum.Health > 0 then
+					local friendly = teamCheckEnabled and pipIsTeammate(plr)
+					if not friendly then
+						local dist = (hrp.Position - originPos).Magnitude
+						if dist < bestDist then
+							bestDist, bestPlr = dist, plr
+						end
+					end
+				end
+			end
+		end
+		return bestPlr, bestDist
+	end
+
 	local function resolveTarget(preferred)
 		if preferred and preferred ~= "" then
 			local p = Players:FindFirstChild(preferred)
@@ -3497,7 +3660,7 @@ end)
 	-- ESP tab controls -----------------------------------------------------
 	local ddRow = Instance.new("Frame")
 	ddRow.Size = UDim2.new(1, 0, 0, 32)
-	ddRow.Position = UDim2.new(0, 0, 0, 466)
+	ddRow.Position = UDim2.new(0, 0, 0, 504)
 	ddRow.BackgroundTransparency = 1
 	ddRow.ZIndex = 20 -- keep the popup above the sliders it opens over
 	ddRow.Parent = espTabFrame
@@ -3529,8 +3692,8 @@ end)
 	end
 
 	local ddList = Instance.new("Frame")
-	ddList.Size = UDim2.new(0, 150, 0, 136)
-	ddList.Position = UDim2.new(1, -150, 0, -140)
+	ddList.Size = UDim2.new(0, 150, 0, 160)
+	ddList.Position = UDim2.new(1, -150, 0, -164)
 	ddList.BackgroundColor3 = Color3.fromRGB(20, 18, 28)
 	ddList.BorderSizePixel = 0
 	ddList.Visible = false
@@ -3564,13 +3727,40 @@ end)
 
 	refreshPlayerList = function()
 		for _, ch in ipairs(ddScroll:GetChildren()) do
-			if ch:IsA("TextButton") then ch:Destroy() end
+			if ch:IsA("TextButton") or ch:IsA("TextLabel") then ch:Destroy() end
 		end
-		local list = {}
-		for _, p in ipairs(Players:GetPlayers()) do table.insert(list, p) end
-		table.sort(list, function(a, b) return a.Name:lower() < b.Name:lower() end)
+
+		-- Teammates first, enemies under them. With Team Check off only real Team
+		-- assignments (plus yourself) count as teammates, otherwise an FFA place
+		-- where everybody shares the neutral TeamColor would list everyone as one.
+		local team, others = {}, {}
+		for _, p in ipairs(Players:GetPlayers()) do
+			local friendly = p == LocalPlayer
+				or (teamCheckEnabled and pipIsTeammate(p))
+				or (LocalPlayer.Team ~= nil and p.Team ~= nil and LocalPlayer.Team == p.Team)
+			table.insert(friendly and team or others, p)
+		end
+		local function byName(a, b) return a.Name:lower() < b.Name:lower() end
+		table.sort(team, byName)
+		table.sort(others, byName)
+
 		local y = 0
-		for _, p in ipairs(list) do
+		local function addHeader(text)
+			local h = Instance.new("TextLabel")
+			h.Size = UDim2.new(1, -6, 0, 16)
+			h.Position = UDim2.new(0, 4, 0, y + 4)
+			h.BackgroundTransparency = 1
+			h.Text = text
+			h.TextColor3 = Color3.fromRGB(150, 150, 170)
+			h.TextSize = 10
+			h.Font = Enum.Font.GothamBold
+			h.TextXAlignment = Enum.TextXAlignment.Left
+			h.ZIndex = 20
+			h.Parent = ddScroll
+			y = y + 20
+		end
+
+		local function addOption(p)
 			local opt = Instance.new("TextButton")
 			opt.Size = UDim2.new(1, -4, 0, 22)
 			opt.Position = UDim2.new(0, 2, 0, y + 2)
@@ -3597,6 +3787,17 @@ end)
 			end)
 			y = y + 24
 		end
+
+		if #team > 0 then
+			addHeader("TEAMMATES")
+			for _, p in ipairs(team) do addOption(p) end
+		end
+		if #others > 0 then
+			if #team > 0 then y = y + 2 end
+			addHeader("ENEMIES")
+			for _, p in ipairs(others) do addOption(p) end
+		end
+
 		ddScroll.CanvasSize = UDim2.new(0, 0, 0, y + 4)
 		ddScroll.CanvasPosition = Vector2.zero
 	end
@@ -3604,10 +3805,12 @@ end)
 	setTarget = function(p)
 		if not p then return end
 		pipTarget = p
-		pipTargetName = p.Name
+		pipCfg.target = p.Name
 		pipAutoYaw = nil
+		pipEnemy, pipEnemyYaw, pipEnemyDist = nil, nil, 0
+		enemyAcc = 1
 		refreshButton()
-		if pipEnabled then clearMirrors() end
+		if pipCfg.enabled then clearMirrors() end
 	end
 
 	ddBtn.MouseButton1Click:Connect(function()
@@ -3627,11 +3830,11 @@ end)
 	end))
 
 	applyEnabled = function(state)
-		pipEnabled = state and true or false
-		if pipEnabled then
+		pipCfg.enabled = state and true or false
+		if pipCfg.enabled then
 			if not pipTarget or not pipTarget.Parent then
-				pipTarget = resolveTarget(pipTargetName)
-				pipTargetName = pipTarget and pipTarget.Name or ""
+				pipTarget = resolveTarget(pipCfg.target)
+				pipCfg.target = pipTarget and pipTarget.Name or ""
 			end
 			refreshButton()
 			gui.Enabled = true
@@ -3658,22 +3861,44 @@ end)
 		end
 	end
 
-	local pipToggleRef = createToggle(espTabFrame, "Player PiP", 386, pipEnabled, function(state)
+	local pipToggleRef = createToggle(espTabFrame, "Player PiP", 386, pipCfg.enabled, function(state)
 		applyEnabled(state)
 	end)
 	settingsRefs.pipEnabled = pipToggleRef
 
-	local pipAutoturnRef = createToggle(espTabFrame, "PiP Autoturn", 424, pipAutoturn, function(state)
-		pipAutoturn = state
+	local pipAutoturnRef, pipEnemyLockRef
+
+	pipAutoturnRef = createToggle(espTabFrame, "PiP Autoturn", 424, pipCfg.autoturn, function(state)
+		pipCfg.autoturn = state
+		if state and pipCfg.enemyLock then
+			pipCfg.enemyLock = false
+			if pipEnemyLockRef then pipEnemyLockRef.Set(false) end
+		end
 	end)
 	settingsRefs.pipAutoturn = pipAutoturnRef
 
-	pipSetEnabled = function(state)
+	pipEnemyLockRef = createToggle(espTabFrame, "PiP Enemy Lock", 466, pipCfg.enemyLock, function(state)
+		pipCfg.enemyLock = state
+		if state then
+			enemyAcc = 1 -- scan on the next frame
+			if pipCfg.autoturn then
+				pipCfg.autoturn = false
+				if pipAutoturnRef then pipAutoturnRef.Set(false) end
+			end
+		end
+	end)
+	settingsRefs.pipEnemyLock = pipEnemyLockRef
+
+	pipCfg.setEnabled = function(state)
 		pipToggleRef.Set(state and true or false)
+		if pipCfg.winW and pipCfg.winH then
+			WINDOW_W, WINDOW_H = pipCfg.winW, pipCfg.winH
+			holder.Size = UDim2.fromOffset(WINDOW_W, WINDOW_H)
+		end
 		applyEnabled(state)
 	end
 
-	pipSetTarget = function(name)
+	pipCfg.setTarget = function(name)
 		local p = Players:FindFirstChild(tostring(name or ""))
 		if p then setTarget(p) end
 	end
@@ -3688,18 +3913,20 @@ end)
 	end
 
 	getgenv().__pipState = function()
-		return string.format("enabled=%s autoturn=%s autoYaw=%s target=%s mirrors=%d world=%s(%d) dist=%.1f yaw=%.1f pitch=%.1f label=%q",
-			tostring(pipEnabled), tostring(pipAutoturn),
+		return string.format("enabled=%s autoturn=%s enemyLock=%s enemy=%s(%.0f) autoYaw=%s target=%s mirrors=%d world=%s(%d) win=%dx%d dist=%.1f yaw=%.1f pitch=%.1f label=%q",
+			tostring(pipCfg.enabled), tostring(pipCfg.autoturn), tostring(pipCfg.enemyLock),
+			pipEnemy and pipEnemy.Name or "none", pipEnemyDist,
 			pipAutoYaw and string.format("%.1f", math.deg(pipAutoYaw)) or "nil",
 			pipTarget and pipTarget.Name or "none",
 			(function() local n = 0 for _ in pairs(mirrors) do n = n + 1 end return n end)(),
 			worldFull and "full" or "radius", mapPartCount,
+			WINDOW_W, WINDOW_H,
 			camDist, math.deg(yaw), math.deg(pitch), label.Text)
 	end
 
 	-- follow loop ----------------------------------------------------------
 	table.insert(connections, RS.RenderStepped:Connect(function(dt)
-		if not pipEnabled then return end
+		if not pipCfg.enabled then return end
 
 		pcall(updateInput)
 		if mouseLocked and not UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
@@ -3707,8 +3934,8 @@ end)
 		end
 
 		if not pipTarget or not pipTarget.Parent then
-			pipTarget = resolveTarget(pipTargetName)
-			pipTargetName = pipTarget and pipTarget.Name or ""
+			pipTarget = resolveTarget(pipCfg.target)
+			pipCfg.target = pipTarget and pipTarget.Name or ""
 			refreshButton()
 		end
 		if not pipTarget then
@@ -3780,9 +4007,32 @@ end)
 			return
 		end
 
-		-- PiP Autoturn: swing the view toward the last direction the target ran
-		-- forward. Sideways / backwards movement is ignored (dot < threshold).
-		if pipAutoturn then
+		-- PiP turn modes (mutually exclusive): enemy lock wins, run-follow otherwise.
+		if pipCfg.enemyLock then
+			enemyAcc = enemyAcc + dt
+			if enemyAcc >= (1 / ENEMY_SCAN_HZ) then
+				enemyAcc = 0
+				local found, dist = scanEnemies(thrp.Position)
+				pipEnemy, pipEnemyDist = found, dist or 0
+			end
+			if pipEnemy then
+				local ec = pipEnemy.Character
+				local ehrp = ec and ec:FindFirstChild("HumanoidRootPart")
+				local ehum = ec and ec:FindFirstChildOfClass("Humanoid")
+				if ehrp and ehum and ehum.Health > 0 then
+					local flat = ehrp.Position - thrp.Position
+					flat = Vector3.new(flat.X, 0, flat.Z)
+					if flat.Magnitude > 0.5 then
+						pipEnemyYaw = math.atan2(-flat.X, -flat.Z)
+					end
+				end
+			end
+			if pipEnemyYaw then
+				local delta = (pipEnemyYaw - yaw + math.pi) % (2 * math.pi) - math.pi
+				local step = AUTO_YAW_RATE * dt
+				yaw = yaw + math.clamp(delta, -step, step)
+			end
+		elseif pipCfg.autoturn then
 			local flat = Vector3.zero
 			local hum = tchar:FindFirstChildOfClass("Humanoid")
 			local md = hum and hum.MoveDirection or Vector3.zero
@@ -3831,8 +4081,16 @@ end)
 		local dir = Vector3.new(math.sin(yaw) * cp, math.sin(pitch), math.cos(yaw) * cp)
 		cam.CFrame = CFrame.lookAt(focus + dir * camDist, focus)
 
-		label.Text = string.format("SPECTATING %s  |  %d chars  |  %.1f  |  %.0f fps",
-			pipTarget.Name, mirrored, camDist, fps)
+		if pipCfg.enemyLock then
+			if pipEnemy then
+				label.Text = string.format("%s  >>  %s (%.0f)", pipTarget.Name, pipEnemy.Name, pipEnemyDist)
+			else
+				label.Text = pipTarget.Name .. "  >>  no enemy"
+			end
+		else
+			label.Text = string.format("SPECTATING %s  |  %d chars  |  %.1f  |  %.0f fps",
+				pipTarget.Name, mirrored, camDist, fps)
+		end
 	end))
 end)()
 
