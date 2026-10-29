@@ -51,39 +51,42 @@ local ultEspEnabled = false
 local autoBlockEnabled = false
 local autoCounterEnabled = false
 local airSwingEnabled = false
-local triggerbotEnabled = false
-local triggerbotKey = Enum.KeyCode.T
-local triggerbotSlot = 1
-local triggerbot2Key = Enum.KeyCode.Y
-local triggerbot2Slot = 2
+-- Triggerbot state (bundled: keeps the main chunk under Luau's 200-local limit)
+local tbState = {
+	enabled = false, -- was triggerbotEnabled
+	key = Enum.KeyCode.T, -- was triggerbotKey
+	slot = 1, -- was triggerbotSlot
+	key2 = Enum.KeyCode.Y, -- was triggerbot2Key
+	slot2 = 2, -- was triggerbot2Slot
+	pending1 = false, -- was triggerbot1Pending
+	pending2 = false, -- was triggerbot2Pending
+	req1 = 0, -- was triggerbot1RequestTime
+	req2 = 0, -- was triggerbot2RequestTime
+	pendingTimeout = 8, -- was triggerPendingTimeout
+	retarget = false, -- was triggerbotRetarget
+	markPlayer = nil, -- was triggerbotMarkPlayer
+	markChar = nil, -- was triggerbotMarkChar
+	wasBlocking = false, -- was triggerbotWasBlocking
+	lastFire = 0, -- was lastTriggerFire
+	lastFire2 = 0, -- was lastTriggerFire2
+	refire = 0.1, -- was triggerRefire
+	awaitingCd = false, -- was triggerbotAwaitingCd
+	pressTime = 0, -- was triggerbotPressTime
+	awaitingCd2 = false, -- was triggerbot2AwaitingCd
+	pressTime2 = 0, -- was triggerbot2PressTime
+	cdTimeout = 1.5, -- was triggerCdTimeout
+	unconfirmed = 0, -- was triggerUnconfirmed
+	unconfirmed2 = 0, -- was triggerUnconfirmed2
+	maxUnconfirmed = 5, -- was triggerMaxUnconfirmed
+	clearRequest = nil, -- was clearTriggerRequest
+}
 local flyEnabled = false
 local flyKey = nil -- unbound by default; set via the Rage keybind
 local flySpeed = 50
 local flyGyro = nil
 local flyVel = nil
-local triggerbot1Pending = false -- Move 1 key pressed: trying to fire slot 1
-local triggerbot2Pending = false -- Move 2 key pressed: trying to fire slot 2
-local triggerbot1RequestTime = 0
-local triggerbot2RequestTime = 0
-local triggerPendingTimeout = 8 -- a fire request expires after this many seconds
-local triggerbotRetarget = false -- a fire key was pressed: re-mark from the live cursor
-local triggerbotMarkPlayer = nil -- sticky lock: acquired once, kept until toggle is disabled
-local triggerbotMarkChar = nil
-local triggerbotWasBlocking = false
-local lastTriggerFire = 0
-local lastTriggerFire2 = 0
-local triggerRefire = 0.1 -- seconds before triggerbot may fire again on the same mark
-local triggerbotAwaitingCd = false -- pressed, waiting for the slot to show cooldown
-local triggerbotPressTime = 0
-local triggerbot2AwaitingCd = false
-local triggerbot2PressTime = 0
-local triggerCdTimeout = 1.5 -- seconds to wait for cooldown before treating the press as swallowed
-local triggerUnconfirmed = 0
-local triggerUnconfirmed2 = 0
-local triggerMaxUnconfirmed = 5 -- safety: stop retrying after this many swallowed presses
 -- Forward declaration: the keypress handler (defined earlier in the file) calls
 -- this to cancel a pending request on re-press; assigned again below.
-local clearTriggerRequest
 local swingRange = 18
 local airSwingDelay = 0.40 -- Seconds after M1 detect to punish (their recovery; biased late so real impacts win first)
 local airSwingCooldown = 0.05 -- Min seconds between Air Swing counters (per-detect gate)
@@ -92,32 +95,38 @@ local autoBlackFlashEnabled = false
 local autoInfinityEnabled = false
 local autoInfinityUnlocked = false
 local autoPlayEnabled = false
-local targetBanCharacters = {}
-local targetBanCharIdx = 1
-local targetBanEnabled = false
-local banActioned = false
-local lastBannedChars = {}
-local antiBanCharacters = {}
-local antiBanCharIdx = 1
-local antiBanEnabled = false
-local antiBanActioned = false
-local antiBanPhase = "ban"
-local antiBanCooldown = 0
-local antiBanPageIdx = 0
-local antiBanPages = {}
-local lastSkillUseTime = 0
-local skillUseInterval = 0.5
-local lastUsedSlot = 0
-local skillFiredTime = 0
-local skillM1LockoutDuration = 0.3
-local lastAutoM1Time = 0
+-- Target/anti-ban state (bundled to lower main-chunk register pressure)
+local banState = {
+	targets = {}, -- was targetBanCharacters
+	targetIdx = 1, -- was targetBanCharIdx
+	targetEnabled = false, -- was targetBanEnabled
+	targetActioned = false, -- was banActioned
+	lastBanned = {}, -- was lastBannedChars
+	antiChars = {}, -- was antiBanCharacters
+	antiIdx = 1, -- was antiBanCharIdx
+	antiEnabled = false, -- was antiBanEnabled
+	antiActioned = false, -- was antiBanActioned
+	antiPhase = "ban", -- was antiBanPhase
+	antiCooldown = 0, -- was antiBanCooldown
+	antiPageIdx = 0, -- was antiBanPageIdx
+	antiPages = {}, -- was antiBanPages
+}
+-- Auto-M1 / auto-skill state (bundled to lower main-chunk register pressure)
+local autoState = {
+	lastSkillUseTime = 0, -- was lastSkillUseTime
+	skillUseInterval = 0.5, -- was skillUseInterval
+	lastUsedSlot = 0, -- was lastUsedSlot
+	skillFiredTime = 0, -- was skillFiredTime
+	skillM1Lockout = 0.3, -- was skillM1LockoutDuration
+	lastAutoM1Time = 0, -- was lastAutoM1Time
+	autoM1Interval = 0.1, -- was autoM1Interval
+	lockTarget = nil, -- was autoLockTarget
+	lockActive = false, -- was autoLockActive
+	sprintEnabled = false, -- was autoSprintEnabled
+	sprintHeld = false, -- was sprintHeld
+	lastModeGTime = 0, -- was lastAutoModeGTime
+}
 
-local autoM1Interval = 0.1
-local autoLockTarget = nil
-local autoLockActive = false
-local autoSprintEnabled = false
-local sprintHeld = false
-local lastAutoModeGTime = 0
 
 local blockingState = false
 local testHoldBlock = false -- test utility: holds F until repressed
@@ -158,23 +167,29 @@ local blockHoldForCounter = 0.35  -- Hold F slightly longer when autocounter is 
 local counterLockoutDuration = 0.08 -- Short lockout (80ms) to allow counter animation to start without disabling future parries
 local counterM1Delay = 0.03 -- Delay (seconds) after block impact before firing counter M1 (tunable via slider)
 
-local arrowPool = {}
-local chargeBillboards = {}
-local moveBillboards = {}
-local maxCooldowns = {}
-local lastCdNums = {}
-local cdChangeTimes = {}
-local cdChangeValues = {}
-local cdRates = {}
-local moveFlashTimes = {}
-local moveInputConns = {}
-local moveEspEnabled = false
-local moveInputsEnabled = false
-local ultEspSize = 3.0
-local moveEspSize = 2.4
-local targetEspEnabled = true
-local targetEspBillboard = nil
-local targetEspAlertTime = 0
+-- Charge/move cooldown trackers (bundled to lower main-chunk register pressure)
+local cdState = {
+	arrowPool = {}, -- was arrowPool
+	charge = {}, -- was chargeBillboards
+	move = {}, -- was moveBillboards
+	max = {}, -- was maxCooldowns
+	lastNums = {}, -- was lastCdNums
+	changeTimes = {}, -- was cdChangeTimes
+	changeValues = {}, -- was cdChangeValues
+	rates = {}, -- was cdRates
+	flashTimes = {}, -- was moveFlashTimes
+	inputConns = {}, -- was moveInputConns
+}
+-- ESP settings/runtime state (bundled to lower main-chunk register pressure)
+local espState = {
+	moveEnabled = false, -- was moveEspEnabled
+	inputsEnabled = false, -- was moveInputsEnabled
+	ultSize = 3.0, -- was ultEspSize
+	moveSize = 2.4, -- was moveEspSize
+	targetEnabled = true, -- was targetEspEnabled
+	targetBillboard = nil, -- was targetEspBillboard
+	targetAlertTime = 0, -- was targetEspAlertTime
+}
 -- Player PiP (viewport spectator): all of its settings live in one table so the
 -- main chunk does not run out of local registers (Luau caps at 200).
 local pipCfg = {
@@ -204,6 +219,30 @@ local VirtualInputManager = game:GetService("VirtualInputManager")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+-- UI decoration helpers (declared once, reused everywhere). Each call site used
+-- to declare its own `local corner/stroke/padding` temporary; some executors
+-- count those against the top-level chunk's 200-local budget and fail compiling
+-- with "Out of local registers ... exceeded limit 200" right after the shell.
+local function addCorner(parent, radius)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = radius
+	c.Parent = parent
+	return c
+end
+local function addStroke(parent, color, thickness)
+	local s = Instance.new("UIStroke")
+	s.Color = color
+	s.Thickness = thickness
+	s.Parent = parent
+	return s
+end
+local function addRightPadding(parent, offset)
+	local p = Instance.new("UIPadding")
+	p.PaddingRight = UDim.new(0, offset)
+	p.Parent = parent
+	return p
+end
 
 -- ====================== COUNTER DIAGNOSTICS ======================
 -- Behaviour-neutral tracing for Auto Block / Auto Counter / Air Swing.
@@ -533,29 +572,28 @@ end
 -- Safely determine GUI parent by testing write permissions
 local parentGui = PlayerGui
 do
-    local testGui = Instance.new("ScreenGui")
-    local testSuccess = pcall(function()
-        testGui.Parent = CoreGui
-        parentGui = CoreGui
-    end)
-    testGui:Destroy()
+	pcall(function()
+		local testGui = Instance.new("ScreenGui")
+		testGui.Parent = CoreGui
+		parentGui = CoreGui
+		testGui:Destroy()
+	end)
 end
 
 -- Clean up any existing instances of PiggyUI in both parents
 do
-    local oldGui1 = PlayerGui:FindFirstChild("PiggyUI")
-    if oldGui1 then pcall(function() oldGui1:Destroy() end) end
-    local oldGuiV2 = PlayerGui:FindFirstChild("PiggyUIV2")
-    if oldGuiV2 then pcall(function() oldGuiV2:Destroy() end) end
-end
-
-if parentGui == CoreGui then
-    do
-        local oldGui2 = CoreGui:FindFirstChild("PiggyUI")
-        if oldGui2 then pcall(function() oldGui2:Destroy() end) end
-        local oldGui2v2 = CoreGui:FindFirstChild("PiggyUIV2")
-        if oldGui2v2 then pcall(function() oldGui2v2:Destroy() end) end
-    end
+	pcall(function()
+		local oldGui1 = PlayerGui:FindFirstChild("PiggyUI")
+		if oldGui1 then oldGui1:Destroy() end
+		local oldGuiV2 = PlayerGui:FindFirstChild("PiggyUIV2")
+		if oldGuiV2 then oldGuiV2:Destroy() end
+		if parentGui == CoreGui then
+			local oldGui2 = CoreGui:FindFirstChild("PiggyUI")
+			if oldGui2 then oldGui2:Destroy() end
+			local oldGui2v2 = CoreGui:FindFirstChild("PiggyUIV2")
+			if oldGui2v2 then oldGui2v2:Destroy() end
+		end
+	end)
 end
 
 do end
@@ -573,12 +611,8 @@ mainFrame.BackgroundColor3 = Color3.fromRGB(24, 24, 30)
 mainFrame.BorderSizePixel = 0
 mainFrame.Parent = screenGui
 
-do
-    local corner = Instance.new("UICorner") corner.CornerRadius = UDim.new(0, 12) corner.Parent = mainFrame
-end
-do
-    local stroke = Instance.new("UIStroke") stroke.Color = Color3.fromRGB(255, 105, 180) stroke.Thickness = 2 stroke.Parent = mainFrame
-end
+addCorner(mainFrame, UDim.new(0, 12))
+addStroke(mainFrame, Color3.fromRGB(255, 105, 180), 2)
 
 -- Counter Status Label (right side, draggable)
 local counterLabel = Instance.new("TextLabel")
@@ -595,26 +629,28 @@ counterLabel.TextSize = 15
 counterLabel.Font = Enum.Font.GothamBold
 counterLabel.TextXAlignment = Enum.TextXAlignment.Center
 counterLabel.Parent = screenGui
-do
-    local labelCorner = Instance.new("UICorner") labelCorner.CornerRadius = UDim.new(0, 6) labelCorner.Parent = counterLabel
-end
+addCorner(counterLabel, UDim.new(0, 6))
 
-local labelDrag, labelDragStart, labelStartPos
+-- Drag state for the floating status labels. One shared table instead of six
+-- top-level locals: the main chunk is tight against Luau's 200-local limit.
+local labelDragState = {}
 table.insert(connections, counterLabel.InputBegan:Connect(function(input)
 	if input.UserInputType == Enum.UserInputType.MouseButton1 then
-		labelDrag = true
-		labelDragStart = input.Position
-		labelStartPos = counterLabel.Position
+		labelDragState.counter = true
+		labelDragState.counterFrom = input.Position
+		labelDragState.counterOrig = counterLabel.Position
 	end
 end))
 table.insert(connections, UserInputService.InputChanged:Connect(function(input)
-	if labelDrag and input.UserInputType == Enum.UserInputType.MouseMovement then
-		local delta = input.Position - labelDragStart
-		counterLabel.Position = UDim2.new(labelStartPos.X.Scale, labelStartPos.X.Offset + delta.X, labelStartPos.Y.Scale, labelStartPos.Y.Offset + delta.Y)
+	if labelDragState.counter and input.UserInputType == Enum.UserInputType.MouseMovement then
+		local delta = input.Position - labelDragState.counterFrom
+		counterLabel.Position = UDim2.new(
+			labelDragState.counterOrig.X.Scale, labelDragState.counterOrig.X.Offset + delta.X,
+			labelDragState.counterOrig.Y.Scale, labelDragState.counterOrig.Y.Offset + delta.Y)
 	end
 end))
 table.insert(connections, UserInputService.InputEnded:Connect(function(input)
-	if input.UserInputType == Enum.UserInputType.MouseButton1 then labelDrag = false end
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then labelDragState.counter = false end
 end))
 
 local function updateCounterLabel()
@@ -643,26 +679,25 @@ infinityLabel.TextSize = 15
 infinityLabel.Font = Enum.Font.GothamBold
 infinityLabel.TextXAlignment = Enum.TextXAlignment.Center
 infinityLabel.Parent = screenGui
-do
-    local infinityLabelCorner = Instance.new("UICorner") infinityLabelCorner.CornerRadius = UDim.new(0, 6) infinityLabelCorner.Parent = infinityLabel
-end
+addCorner(infinityLabel, UDim.new(0, 6))
 
-local infLabelDrag, infLabelDragStart, infLabelStartPos
 table.insert(connections, infinityLabel.InputBegan:Connect(function(input)
 	if input.UserInputType == Enum.UserInputType.MouseButton1 then
-		infLabelDrag = true
-		infLabelDragStart = input.Position
-		infLabelStartPos = infinityLabel.Position
+		labelDragState.inf = true
+		labelDragState.infFrom = input.Position
+		labelDragState.infOrig = infinityLabel.Position
 	end
 end))
 table.insert(connections, UserInputService.InputChanged:Connect(function(input)
-	if infLabelDrag and input.UserInputType == Enum.UserInputType.MouseMovement then
-		local delta = input.Position - infLabelDragStart
-		infinityLabel.Position = UDim2.new(infLabelStartPos.X.Scale, infLabelStartPos.X.Offset + delta.X, infLabelStartPos.Y.Scale, infLabelStartPos.Y.Offset + delta.Y)
+	if labelDragState.inf and input.UserInputType == Enum.UserInputType.MouseMovement then
+		local delta = input.Position - labelDragState.infFrom
+		infinityLabel.Position = UDim2.new(
+			labelDragState.infOrig.X.Scale, labelDragState.infOrig.X.Offset + delta.X,
+			labelDragState.infOrig.Y.Scale, labelDragState.infOrig.Y.Offset + delta.Y)
 	end
 end))
 table.insert(connections, UserInputService.InputEnded:Connect(function(input)
-	if input.UserInputType == Enum.UserInputType.MouseButton1 then infLabelDrag = false end
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then labelDragState.inf = false end
 end))
 
 local function updateInfinityLabel()
@@ -693,13 +728,8 @@ do
     lockRing.Size = UDim2.new(1, 0, 1, 0)
     lockRing.BackgroundTransparency = 1
     lockRing.Parent = lockIndicator
-    local lockRingCorner = Instance.new("UICorner")
-    lockRingCorner.CornerRadius = UDim.new(1, 0)
-    lockRingCorner.Parent = lockRing
-    local lockRingStroke = Instance.new("UIStroke")
-    lockRingStroke.Color = Color3.fromRGB(255, 50, 50)
-    lockRingStroke.Thickness = 2
-    lockRingStroke.Parent = lockRing
+    addCorner(lockRing, UDim.new(1, 0))
+    addStroke(lockRing, Color3.fromRGB(255, 50, 50), 2)
 end
 
 local function getLockTorso()
@@ -728,25 +758,27 @@ titleBar.BackgroundColor3 = Color3.fromRGB(32, 32, 40)
 titleBar.BorderSizePixel = 0
 titleBar.Parent = mainFrame
 
-do
-    local titleCorner = Instance.new("UICorner") titleCorner.CornerRadius = UDim.new(0, 12) titleCorner.Parent = titleBar
-end
+addCorner(titleBar, UDim.new(0, 12))
 
 -- Flatten the bottom corners of the title bar
 do
-    local titleFlat = Instance.new("Frame")
-    titleFlat.Size = UDim2.new(1, 0, 0, 12)
-    titleFlat.Position = UDim2.new(0, 0, 1, -12)
-    titleFlat.BackgroundColor3 = Color3.fromRGB(32, 32, 40)
-    titleFlat.BorderSizePixel = 0
-    titleFlat.Parent = titleBar
+	pcall(function()
+		local titleFlat = Instance.new("Frame")
+		titleFlat.Size = UDim2.new(1, 0, 0, 12)
+		titleFlat.Position = UDim2.new(0, 0, 1, -12)
+		titleFlat.BackgroundColor3 = Color3.fromRGB(32, 32, 40)
+		titleFlat.BorderSizePixel = 0
+		titleFlat.Parent = titleBar
+	end)
 end
 
 do
-    local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, -40, 1, 0) title.Position = UDim2.new(0, 12, 0, 0)
-    title.BackgroundTransparency = 1 title.Text = "🐷 Piggy Hub" title.TextColor3 = Color3.fromRGB(255, 105, 180)
-    title.TextSize = 18 title.Font = Enum.Font.GothamBold title.TextXAlignment = Enum.TextXAlignment.Left title.Parent = titleBar
+	pcall(function()
+		local title = Instance.new("TextLabel")
+		title.Size = UDim2.new(1, -40, 1, 0) title.Position = UDim2.new(0, 12, 0, 0)
+		title.BackgroundTransparency = 1 title.Text = "🐷 Piggy Hub" title.TextColor3 = Color3.fromRGB(255, 105, 180)
+		title.TextSize = 18 title.Font = Enum.Font.GothamBold title.TextXAlignment = Enum.TextXAlignment.Left title.Parent = titleBar
+	end)
 end
 
 local minimizeButton = Instance.new("TextButton")
@@ -754,9 +786,7 @@ minimizeButton.Size = UDim2.new(0, 24, 0, 24) minimizeButton.Position = UDim2.ne
 minimizeButton.BackgroundColor3 = Color3.fromRGB(45, 45, 55) minimizeButton.Text = "🐽"
 minimizeButton.TextSize = 16 minimizeButton.TextColor3 = Color3.fromRGB(255, 255, 255)
 minimizeButton.Font = Enum.Font.GothamBold minimizeButton.Parent = titleBar
-do
-    local minCorner = Instance.new("UICorner") minCorner.CornerRadius = UDim.new(0, 6) minCorner.Parent = minimizeButton
-end
+addCorner(minimizeButton, UDim.new(0, 6))
 
 -- Body Frame (Enables clean minimization)
 local bodyFrame = Instance.new("Frame")
@@ -772,35 +802,39 @@ tabsContainer.Position = UDim2.new(0, 10, 0, 10)
 tabsContainer.BackgroundColor3 = Color3.fromRGB(28, 28, 36)
 tabsContainer.BorderSizePixel = 0
 tabsContainer.Parent = bodyFrame
+addCorner(tabsContainer, UDim.new(0, 8))
+
 do
-    local sideCorner = Instance.new("UICorner") sideCorner.CornerRadius = UDim.new(0, 8) sideCorner.Parent = tabsContainer
+	pcall(function()
+		local sideHeader = Instance.new("TextLabel")
+		sideHeader.Size = UDim2.new(1, 0, 0, 22)
+		sideHeader.BackgroundTransparency = 1
+		sideHeader.Text = "MENU"
+		sideHeader.TextColor3 = Color3.fromRGB(120, 120, 135)
+		sideHeader.TextSize = 11
+		sideHeader.Font = Enum.Font.GothamBold
+		sideHeader.Parent = tabsContainer
+	end)
 end
 
 do
-    local sideHeader = Instance.new("TextLabel")
-    sideHeader.Size = UDim2.new(1, 0, 0, 22)
-    sideHeader.BackgroundTransparency = 1
-    sideHeader.Text = "MENU"
-    sideHeader.TextColor3 = Color3.fromRGB(120, 120, 135)
-    sideHeader.TextSize = 11
-    sideHeader.Font = Enum.Font.GothamBold
-    sideHeader.Parent = tabsContainer
-end
-
-do
-    local sideLayout = Instance.new("UIListLayout")
-    sideLayout.FillDirection = Enum.FillDirection.Vertical
-    sideLayout.SortOrder = Enum.SortOrder.LayoutOrder
-    sideLayout.Padding = UDim.new(0, 6)
-    sideLayout.VerticalAlignment = Enum.VerticalAlignment.Top
-    sideLayout.Parent = tabsContainer
+	pcall(function()
+		local sideLayout = Instance.new("UIListLayout")
+		sideLayout.FillDirection = Enum.FillDirection.Vertical
+		sideLayout.SortOrder = Enum.SortOrder.LayoutOrder
+		sideLayout.Padding = UDim.new(0, 6)
+		sideLayout.VerticalAlignment = Enum.VerticalAlignment.Top
+		sideLayout.Parent = tabsContainer
+	end)
 end
 do
-    local sidePadding = Instance.new("UIPadding")
-    sidePadding.PaddingTop = UDim.new(0, 28)
-    sidePadding.PaddingLeft = UDim.new(0, 6)
-    sidePadding.PaddingRight = UDim.new(0, 6)
-    sidePadding.Parent = tabsContainer
+	pcall(function()
+		local sidePadding = Instance.new("UIPadding")
+		sidePadding.PaddingTop = UDim.new(0, 28)
+		sidePadding.PaddingLeft = UDim.new(0, 6)
+		sidePadding.PaddingRight = UDim.new(0, 6)
+		sidePadding.Parent = tabsContainer
+	end)
 end
 
 local function makeTabBtn(name, order, isFirst)
@@ -818,97 +852,100 @@ local function makeTabBtn(name, order, isFirst)
 	return btn
 end
 
-local mainTabBtn = makeTabBtn("Lock", 1, true)
-local espTabBtn = makeTabBtn("ESP", 2, false)
-local miscTabBtn = makeTabBtn("Misc", 3, false)
-local rageTabBtn = makeTabBtn("Rage", 4, false)
-local charactersTabBtn = makeTabBtn("Characters", 5, false)
-local configTabBtn = makeTabBtn("Config", 6, false)
-local skinTabBtn = makeTabBtn("Skin", 7, false)
+-- Tab buttons live in one table (some executors cap the top-level chunk at
+-- 200 total locals; 7 separate button locals were pushing it over).
+local tabButtons = {}
+tabButtons.main = makeTabBtn("Lock", 1, true)
+tabButtons.esp = makeTabBtn("ESP", 2, false)
+tabButtons.misc = makeTabBtn("Misc", 3, false)
+tabButtons.rage = makeTabBtn("Rage", 4, false)
+tabButtons.chars = makeTabBtn("Characters", 5, false)
+tabButtons.config = makeTabBtn("Config", 6, false)
+tabButtons.skin = makeTabBtn("Skin", 7, false)
 
 -- Divider between sidebar and content
+-- Built inside a closure ("Out of local registers when trying to allocate
+-- divider": the executor runs out of the top-level chunk's 200 local
+-- registers right at this declaration, so `divider` must not be one of them).
 do
-    local divider = Instance.new("Frame")
-    divider.Size = UDim2.new(0, 1, 1, -20)
-    divider.Position = UDim2.new(0, 128, 0, 10)
-    divider.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
-    divider.BorderSizePixel = 0
-    divider.Parent = bodyFrame
+	pcall(function()
+		local divider = Instance.new("Frame")
+		divider.Size = UDim2.new(0, 1, 1, -20)
+		divider.Position = UDim2.new(0, 128, 0, 10)
+		divider.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+		divider.BorderSizePixel = 0
+		divider.Parent = bodyFrame
+	end)
 end
 
 -- Tab Container Frames (content area, right of sidebar)
-local mainTabFrame = Instance.new("Frame")
-mainTabFrame.Size = UDim2.new(1, -150, 1, -20)
-mainTabFrame.Position = UDim2.new(0, 140, 0, 10)
-mainTabFrame.BackgroundTransparency = 1
-mainTabFrame.Visible = true
-mainTabFrame.Parent = bodyFrame
+-- Tab container frames (content area, right of sidebar) live in one table for
+-- the same 200-local-limit reason as tabButtons above.
+local tabFrames = {}
+tabFrames.main = Instance.new("Frame")
+tabFrames.main.Size = UDim2.new(1, -150, 1, -20)
+tabFrames.main.Position = UDim2.new(0, 140, 0, 10)
+tabFrames.main.BackgroundTransparency = 1
+tabFrames.main.Visible = true
+tabFrames.main.Parent = bodyFrame
 
-local espTabFrame = Instance.new("ScrollingFrame")
-espTabFrame.Size = UDim2.new(1, -150, 1, -20)
-espTabFrame.Position = UDim2.new(0, 140, 0, 10)
-espTabFrame.BackgroundTransparency = 1
-espTabFrame.Visible = false
-espTabFrame.Parent = bodyFrame
-espTabFrame.CanvasSize = UDim2.new(0, 0, 0, 560)
-espTabFrame.ScrollBarThickness = 6
-espTabFrame.ScrollBarImageColor3 = Color3.fromRGB(80, 80, 95)
-espTabFrame.ScrollingDirection = Enum.ScrollingDirection.Y
-espTabFrame.BorderSizePixel = 0
-do
-    local espPadding = Instance.new("UIPadding")
-    espPadding.PaddingRight = UDim.new(0, 10)
-    espPadding.Parent = espTabFrame
-end
+tabFrames.esp = Instance.new("ScrollingFrame")
+tabFrames.esp.Size = UDim2.new(1, -150, 1, -20)
+tabFrames.esp.Position = UDim2.new(0, 140, 0, 10)
+tabFrames.esp.BackgroundTransparency = 1
+tabFrames.esp.Visible = false
+tabFrames.esp.Parent = bodyFrame
+tabFrames.esp.CanvasSize = UDim2.new(0, 0, 0, 560)
+tabFrames.esp.ScrollBarThickness = 6
+tabFrames.esp.ScrollBarImageColor3 = Color3.fromRGB(80, 80, 95)
+tabFrames.esp.ScrollingDirection = Enum.ScrollingDirection.Y
+tabFrames.esp.BorderSizePixel = 0
+addRightPadding(tabFrames.esp, 10)
 
-local miscTabFrame = Instance.new("ScrollingFrame")
-miscTabFrame.Size = UDim2.new(1, -150, 1, -20)
-miscTabFrame.Position = UDim2.new(0, 140, 0, 10)
-miscTabFrame.BackgroundTransparency = 1
-miscTabFrame.Visible = false
-miscTabFrame.Parent = bodyFrame
-miscTabFrame.CanvasSize = UDim2.new(0, 0, 0, 1450)
-miscTabFrame.ScrollBarThickness = 6
-miscTabFrame.ScrollBarImageColor3 = Color3.fromRGB(80, 80, 95)
-miscTabFrame.ScrollingDirection = Enum.ScrollingDirection.Y
-miscTabFrame.BorderSizePixel = 0
-do
-    local miscPadding = Instance.new("UIPadding")
-    miscPadding.PaddingRight = UDim.new(0, 10)
-    miscPadding.Parent = miscTabFrame
-end
+tabFrames.misc = Instance.new("ScrollingFrame")
+tabFrames.misc.Size = UDim2.new(1, -150, 1, -20)
+tabFrames.misc.Position = UDim2.new(0, 140, 0, 10)
+tabFrames.misc.BackgroundTransparency = 1
+tabFrames.misc.Visible = false
+tabFrames.misc.Parent = bodyFrame
+tabFrames.misc.CanvasSize = UDim2.new(0, 0, 0, 1450)
+tabFrames.misc.ScrollBarThickness = 6
+tabFrames.misc.ScrollBarImageColor3 = Color3.fromRGB(80, 80, 95)
+tabFrames.misc.ScrollingDirection = Enum.ScrollingDirection.Y
+tabFrames.misc.BorderSizePixel = 0
+addRightPadding(tabFrames.misc, 10)
 
-local configTabFrame = Instance.new("Frame")
-configTabFrame.Size = UDim2.new(1, -150, 1, -20)
-configTabFrame.Position = UDim2.new(0, 140, 0, 10)
-configTabFrame.BackgroundTransparency = 1
-configTabFrame.Visible = false
-configTabFrame.Parent = bodyFrame
+tabFrames.config = Instance.new("Frame")
+tabFrames.config.Size = UDim2.new(1, -150, 1, -20)
+tabFrames.config.Position = UDim2.new(0, 140, 0, 10)
+tabFrames.config.BackgroundTransparency = 1
+tabFrames.config.Visible = false
+tabFrames.config.Parent = bodyFrame
 
-local rageTabFrame = Instance.new("Frame")
-rageTabFrame.Size = UDim2.new(1, -150, 1, -20)
-rageTabFrame.Position = UDim2.new(0, 140, 0, 10)
-rageTabFrame.BackgroundTransparency = 1
-rageTabFrame.Visible = false
-rageTabFrame.Parent = bodyFrame
+tabFrames.rage = Instance.new("Frame")
+tabFrames.rage.Size = UDim2.new(1, -150, 1, -20)
+tabFrames.rage.Position = UDim2.new(0, 140, 0, 10)
+tabFrames.rage.BackgroundTransparency = 1
+tabFrames.rage.Visible = false
+tabFrames.rage.Parent = bodyFrame
 
-local charactersTabFrame = Instance.new("Frame")
-charactersTabFrame.Size = UDim2.new(1, -150, 1, -20)
-charactersTabFrame.Position = UDim2.new(0, 140, 0, 10)
-charactersTabFrame.BackgroundTransparency = 1
-charactersTabFrame.Visible = false
-charactersTabFrame.Parent = bodyFrame
+tabFrames.chars = Instance.new("Frame")
+tabFrames.chars.Size = UDim2.new(1, -150, 1, -20)
+tabFrames.chars.Position = UDim2.new(0, 140, 0, 10)
+tabFrames.chars.BackgroundTransparency = 1
+tabFrames.chars.Visible = false
+tabFrames.chars.Parent = bodyFrame
 
-local skinTabFrame = Instance.new("ScrollingFrame")
-skinTabFrame.Size = UDim2.new(1, -150, 1, -20)
-skinTabFrame.Position = UDim2.new(0, 140, 0, 10)
-skinTabFrame.BackgroundTransparency = 1
-skinTabFrame.Visible = false
-skinTabFrame.Parent = bodyFrame
-skinTabFrame.ScrollBarThickness = 6
-skinTabFrame.ScrollBarImageColor3 = Color3.fromRGB(80, 80, 95)
-skinTabFrame.ScrollingDirection = Enum.ScrollingDirection.Y
-skinTabFrame.BorderSizePixel = 0
+tabFrames.skin = Instance.new("ScrollingFrame")
+tabFrames.skin.Size = UDim2.new(1, -150, 1, -20)
+tabFrames.skin.Position = UDim2.new(0, 140, 0, 10)
+tabFrames.skin.BackgroundTransparency = 1
+tabFrames.skin.Visible = false
+tabFrames.skin.Parent = bodyFrame
+tabFrames.skin.ScrollBarThickness = 6
+tabFrames.skin.ScrollBarImageColor3 = Color3.fromRGB(80, 80, 95)
+tabFrames.skin.ScrollingDirection = Enum.ScrollingDirection.Y
+tabFrames.skin.BorderSizePixel = 0
 
 -- ====================== SKIN CHANGER ======================
 -- Built inside a function (not a bare do-block) so its ~100 locals get their
@@ -949,7 +986,7 @@ local function makeBox(ph)
 	box.TextSize = 12
 	box.Font = Enum.Font.Gotham
 	box.ClearTextOnFocus = false
-	box.Parent = skinTabFrame
+	box.Parent = tabFrames.skin
 	local bc = Instance.new("UICorner"); bc.CornerRadius = UDim.new(0, 5); bc.Parent = box
 	local bs = Instance.new("UIStroke"); bs.Color = bdr; bs.Thickness = 1; bs.Parent = box
 	return box
@@ -964,7 +1001,7 @@ local function makeBtn(text, color, cb)
 	btn.TextColor3 = txtPri
 	btn.TextSize = 12
 	btn.Font = Enum.Font.GothamSemibold
-	btn.Parent = skinTabFrame
+	btn.Parent = tabFrames.skin
 	local bc = Instance.new("UICorner"); bc.CornerRadius = UDim.new(0, 5); bc.Parent = btn
 	btn.InputBegan:Connect(function(inp, proc)
 		if proc then return end
@@ -979,7 +1016,7 @@ local function makeLabeledRow(label, default)
 	local row = Instance.new("Frame")
 	row.Size = UDim2.new(1, 0, 0, 28)
 	row.BackgroundTransparency = 1
-	row.Parent = skinTabFrame
+	row.Parent = tabFrames.skin
 	local lbl = Instance.new("TextLabel")
 	lbl.Size = UDim2.new(0, 110, 1, 0)
 	lbl.BackgroundTransparency = 1
@@ -1002,7 +1039,7 @@ end
 local statusLbl = Instance.new("TextLabel")
 statusLbl.Size = UDim2.new(1, 0, 0, 20); statusLbl.BackgroundColor3 = Color3.fromRGB(14, 12, 22)
 statusLbl.BorderSizePixel = 0; statusLbl.Text = ""; statusLbl.TextColor3 = Color3.fromRGB(140, 200, 140)
-statusLbl.TextSize = 11; statusLbl.Font = Enum.Font.Gotham; statusLbl.Parent = skinTabFrame
+statusLbl.TextSize = 11; statusLbl.Font = Enum.Font.Gotham; statusLbl.Parent = tabFrames.skin
 local sc = Instance.new("UICorner"); sc.CornerRadius = UDim.new(0, 4); sc.Parent = statusLbl
 
 local function setStatus(msg, color)
@@ -1089,7 +1126,7 @@ makeBtn("Reset All", Color3.fromRGB(65, 18, 18), function()
 end)
 
 local rotRow = Instance.new("Frame")
-rotRow.Size = UDim2.new(1, 0, 0, 28); rotRow.BackgroundTransparency = 1; rotRow.Parent = skinTabFrame
+rotRow.Size = UDim2.new(1, 0, 0, 28); rotRow.BackgroundTransparency = 1; rotRow.Parent = tabFrames.skin
 local rotLbl = Instance.new("TextLabel")
 rotLbl.Size = UDim2.new(0, 110, 1, 0); rotLbl.BackgroundTransparency = 1; rotLbl.Text = "Angle (degrees):"
 rotLbl.TextColor3 = txtSec; rotLbl.TextSize = 12; rotLbl.Font = Enum.Font.Gotham; rotLbl.TextXAlignment = Enum.TextXAlignment.Left; rotLbl.Parent = rotRow
@@ -1340,7 +1377,7 @@ end
 
 local saveBtn = Instance.new("TextButton")
 saveBtn.Size = UDim2.new(1, 0, 0, 30); saveBtn.BackgroundColor3 = Color3.fromRGB(40, 55, 40); saveBtn.BorderSizePixel = 0
-saveBtn.Text = "Save Preset"; saveBtn.TextColor3 = txtPri; saveBtn.TextSize = 12; saveBtn.Font = Enum.Font.GothamSemibold; saveBtn.Parent = skinTabFrame
+saveBtn.Text = "Save Preset"; saveBtn.TextColor3 = txtPri; saveBtn.TextSize = 12; saveBtn.Font = Enum.Font.GothamSemibold; saveBtn.Parent = tabFrames.skin
 local sbc = Instance.new("UICorner"); sbc.CornerRadius = UDim.new(0, 5); sbc.Parent = saveBtn
 saveBtn.InputBegan:Connect(function(inp, proc)
 	if proc then return end
@@ -1356,7 +1393,7 @@ end)
 
 
 local presetListFrame = Instance.new("Frame")
-presetListFrame.Size = UDim2.new(1, 0, 0, 0); presetListFrame.BackgroundTransparency = 1; presetListFrame.Parent = skinTabFrame; presetListFrame.ClipsDescendants = true
+presetListFrame.Size = UDim2.new(1, 0, 0, 0); presetListFrame.BackgroundTransparency = 1; presetListFrame.Parent = tabFrames.skin; presetListFrame.ClipsDescendants = true
 
 local function refreshPresetList()
 	for _, c in presetListFrame:GetChildren() do c:Destroy() end
@@ -1405,7 +1442,7 @@ end
 
 local refreshBtn = Instance.new("TextButton")
 refreshBtn.Size = UDim2.new(1, 0, 0, 26); refreshBtn.BackgroundColor3 = Color3.fromRGB(195, 28, 28); refreshBtn.BorderSizePixel = 0
-refreshBtn.Text = "Refresh List"; refreshBtn.TextColor3 = txtPri; refreshBtn.TextSize = 11; refreshBtn.Font = Enum.Font.GothamSemibold; refreshBtn.Parent = skinTabFrame
+refreshBtn.Text = "Refresh List"; refreshBtn.TextColor3 = txtPri; refreshBtn.TextSize = 11; refreshBtn.Font = Enum.Font.GothamSemibold; refreshBtn.Parent = tabFrames.skin
 local rfc = Instance.new("UICorner"); rfc.CornerRadius = UDim.new(0, 5); rfc.Parent = refreshBtn
 refreshBtn.InputBegan:Connect(function(inp, proc) if proc then return end; if inp.UserInputType == Enum.UserInputType.MouseButton1 then refreshPresetList() end end)
 refreshPresetList()
@@ -1573,7 +1610,7 @@ _G.__SkinCleanup = { enforceCor = enforceCor }
 
 local lockBtn = Instance.new("TextButton")
 lockBtn.Size = UDim2.new(1, 0, 0, 32); lockBtn.BackgroundColor3 = Color3.fromRGB(30, 28, 38); lockBtn.BorderSizePixel = 0
-lockBtn.Text = "Lock: OFF"; lockBtn.TextColor3 = Color3.fromRGB(200, 80, 80); lockBtn.TextSize = 13; lockBtn.Font = Enum.Font.GothamBold; lockBtn.Parent = skinTabFrame
+lockBtn.Text = "Lock: OFF"; lockBtn.TextColor3 = Color3.fromRGB(200, 80, 80); lockBtn.TextSize = 13; lockBtn.Font = Enum.Font.GothamBold; lockBtn.Parent = tabFrames.skin
 local lc2 = Instance.new("UICorner"); lc2.CornerRadius = UDim.new(0, 6); lc2.Parent = lockBtn
 local lockStroke = Instance.new("UIStroke"); lockStroke.Color = Color3.fromRGB(60, 8, 8); lockStroke.Thickness = 2; lockStroke.Parent = lockBtn
 lockBtn.InputBegan:Connect(function(inp, proc)
@@ -1616,12 +1653,12 @@ end))
 local skinLayout = Instance.new("UIListLayout")
 skinLayout.Padding = UDim.new(0, 6)
 skinLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-skinLayout.Parent = skinTabFrame
+skinLayout.Parent = tabFrames.skin
 skinLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-	skinTabFrame.CanvasSize = UDim2.new(0, 0, 0, skinLayout.AbsoluteContentSize.Y + 20)
+	tabFrames.skin.CanvasSize = UDim2.new(0, 0, 0, skinLayout.AbsoluteContentSize.Y + 20)
 end)
 task.spawn(function()
-	skinTabFrame.CanvasSize = UDim2.new(0, 0, 0, skinLayout.AbsoluteContentSize.Y + 20)
+	tabFrames.skin.CanvasSize = UDim2.new(0, 0, 0, skinLayout.AbsoluteContentSize.Y + 20)
 end)
 
 end
@@ -1633,46 +1670,52 @@ local recentM1Time = os.clock()
 -- Fly / HeadAttach state (lives here, not top-level: the main chunk is at
 -- the 200-register limit). All users are below in this IIFE.
 local flySwingTime = 0 -- last own-M1-swing timestamp (fly slows while fresh)
-local headAttachEnabled = false
-local headAttachKey = nil -- unbound by default; hold via the Rage keybind
-local headAttachOffset = 0 -- studs beyond the target from your side (0 = directly above head)
-local headAttachHolding = false
-local headAttachFlying = false
-local headAttachCurrent = nil
-local headAttachToggleObj = nil
-local headAttachOffsetDir = nil -- latched hover direction (camera-anchored, survives degenerate frames)
+-- HeadAttach state + tuning (bundled to keep the wrapped chunk under the register limit)
+local hattState = {
+	enabled = false, -- was headAttachEnabled
+	key = nil, -- was headAttachKey
+	offset = 0, -- was headAttachOffset
+	holding = false, -- was headAttachHolding
+	flying = false, -- was headAttachFlying
+	current = nil, -- was headAttachCurrent
+	toggleObj = nil, -- was headAttachToggleObj
+	offsetDir = nil, -- was headAttachOffsetDir
+	above = 3.2, -- was HEAD_ATTACH_ABOVE
+	chase = 0.35, -- was HEAD_ATTACH_CHASE
+	stickDist = 6, -- was HEAD_ATTACH_STICK_DIST
+	stick = 0.2, -- was HEAD_ATTACH_STICK
+	deadzone = 0.8, -- was HEAD_ATTACH_DEADZONE
+	bob = 0.22, -- was HEAD_ATTACH_BOB
+	bobSpeed = 2.1, -- was HEAD_ATTACH_BOB_SPEED
+	sway = 0.8, -- was HEAD_ATTACH_SWAY
+	swaySpeed = 1.4, -- was HEAD_ATTACH_SWAY_SPEED
+	switchMargin = 0.6, -- was HEAD_ATTACH_SWITCH_MARGIN
+	maxRange = 16, -- was HEAD_ATTACH_MAX_RANGE
+}
 -- HeadAttach tuning (ported from headride.luau)
-local HEAD_ATTACH_ABOVE = 3.2
-local HEAD_ATTACH_CHASE = 0.35
-local HEAD_ATTACH_STICK_DIST = 6
-local HEAD_ATTACH_STICK = 0.2
-local HEAD_ATTACH_DEADZONE = 0.8
-local HEAD_ATTACH_BOB = 0.22
-local HEAD_ATTACH_BOB_SPEED = 2.1
-local HEAD_ATTACH_SWAY = 0.8
-local HEAD_ATTACH_SWAY_SPEED = 1.4
-local HEAD_ATTACH_SWITCH_MARGIN = 0.6
-local HEAD_ATTACH_MAX_RANGE = 16
 -- Hollow Purple chain state (Characters > Gojo). Ported from
 -- hollow_purple.luau: HP orb spawns anchored <0.15s then rides unanchored
 -- physics (~250/s, ~2.15s life), so client teleports move real server hits.
-local hpChainEnabled = false
-local hpChainToggleObj = nil
-local HP_CHAIN_RADIUS = 600
-local HP_CHAIN_DELAY = 0.02
-local HP_ARM_DELAY = 0.2
-local HP_MIN_BALL_SIZE = 8
-local HP_OWN_SHOT_RADIUS = 150
+-- Hollow Purple / Spirit Gun chain state + tuning (bundled for register headroom)
+local chainState = {
+	hpEnabled = false, -- was hpChainEnabled
+	hpToggle = nil, -- was hpChainToggleObj
+	hpRadius = 600, -- was HP_CHAIN_RADIUS
+	hpDelay = 0.02, -- was HP_CHAIN_DELAY
+	hpArmDelay = 0.2, -- was HP_ARM_DELAY
+	hpMinSize = 8, -- was HP_MIN_BALL_SIZE
+	hpOwnRadius = 150, -- was HP_OWN_SHOT_RADIUS
+	sgEnabled = false, -- was sgChainEnabled
+	sgToggle = nil, -- was sgChainToggleObj
+	sgRadius = 600, -- was SG_CHAIN_RADIUS
+	sgDelay = 0.12, -- was SG_CHAIN_DELAY
+	sgArmDelay = 0.15, -- was SG_ARM_DELAY
+	sgMaxSize = 8, -- was SG_MAX_BALL_SIZE
+	sgOwnRadius = 150, -- was SG_OWN_SHOT_RADIUS
+}
 -- Spirit Gun chain state (Characters > Yusuke). Ported from spirit_gun.luau:
 -- Yusuke Ball is small (size filter keeps HP orbs out), unanchored physics
 -- with BodyVelocity, ~6s life. Same teleport+homing treatment as HP.
-local sgChainEnabled = false
-local sgChainToggleObj = nil
-local SG_CHAIN_RADIUS = 600
-local SG_CHAIN_DELAY = 0.12
-local SG_ARM_DELAY = 0.15
-local SG_MAX_BALL_SIZE = 8
-local SG_OWN_SHOT_RADIUS = 150
 
 -- ====================== CONFIG MANAGER ======================
 local HttpService = game:GetService("HttpService")
@@ -1680,6 +1723,13 @@ local CONFIG_FOLDER = "PiggyHub/configs/"
 local settingsRefs = {}
 local targetBanBoxRefs = {}
 local antiBanBoxRef = {}
+
+-- Forward declaration: aiState (Auto Infinity section) is defined further down.
+-- Without this, ConfigManager resolves "aiState" as a nil global, so the save
+-- (collectSettings) and load would abort internally - autoload dies right at
+-- aiState.lookSensitivity before the widget-visual restore pass ever runs,
+-- leaving toggles/keybinds showing defaults while the state is actually loaded.
+local aiState -- forward, real table assigned in the Auto Infinity section
 
 local ConfigManager = {}
 
@@ -1706,15 +1756,15 @@ function ConfigManager.collectSettings()
 		flyEnabled = flyEnabled,
 		flyKey = (flyKey and flyKey.Name) or "None",
 		flySpeed = flySpeed,
-		headAttachEnabled = headAttachEnabled,
-		headAttachKey = (headAttachKey and headAttachKey.Name) or "None",
-		headAttachOffset = headAttachOffset,
-		hpChainEnabled = hpChainEnabled,
-		sgChainEnabled = sgChainEnabled,
-		moveEspEnabled = moveEspEnabled,
+		headAttachEnabled = hattState.enabled,
+		headAttachKey = (hattState.key and hattState.key.Name) or "None",
+		headAttachOffset = hattState.offset,
+		hpChainEnabled = chainState.hpEnabled,
+		sgChainEnabled = chainState.sgEnabled,
+		moveEspEnabled = espState.moveEnabled,
 		ultEspEnabled = ultEspEnabled,
 		arrowsEnabled = arrowsEnabled,
-		moveInputsEnabled = moveInputsEnabled,
+		moveInputsEnabled = espState.inputsEnabled,
 		autoBlockEnabled = autoBlockEnabled,
 		blockTapDelay = blockTapDelay,
 		blockTapDuration = blockTapDuration,
@@ -1724,34 +1774,34 @@ function ConfigManager.collectSettings()
 		airSwingEnabled = airSwingEnabled,
 		swingRange = swingRange,
 		airSwingDelay = airSwingDelay,
-		triggerbotEnabled = triggerbotEnabled,
-		triggerbotKey = (triggerbotKey and triggerbotKey.Name) or "None",
-		triggerbotSlot = triggerbotSlot,
-		triggerbot2Key = (triggerbot2Key and triggerbot2Key.Name) or "None",
-		triggerbot2Slot = triggerbot2Slot,
+		triggerbotEnabled = tbState.enabled,
+		triggerbotKey = (tbState.key and tbState.key.Name) or "None",
+		triggerbotSlot = tbState.slot,
+		triggerbot2Key = (tbState.key2 and tbState.key2.Name) or "None",
+		triggerbot2Slot = tbState.slot2,
 		autoInfinityKey = (autoInfinityKey and autoInfinityKey.Name) or "None",
 		toggleUIKey = (toggleUIKey and toggleUIKey.Name) or "None",
 		autoBlackFlashEnabled = autoBlackFlashEnabled,
 		autoInfinityEnabled = autoInfinityEnabled,
 		autoInfinityUnlocked = autoInfinityUnlocked,
-		autoInfinityLookSensitivity = autoInfinityLookSensitivity,
-		autoInfinityRayRadius = autoInfinityRayRadius,
+		autoInfinityLookSensitivity = aiState.lookSensitivity,
+		autoInfinityRayRadius = aiState.rayRadius,
 		autoPlayEnabled = autoPlayEnabled,
-		autoSprintEnabled = autoSprintEnabled,
+		autoSprintEnabled = autoState.sprintEnabled,
 		targetBanText1 = targetBanBoxRefs[1] and targetBanBoxRefs[1].Text or "",
 		targetBanText2 = targetBanBoxRefs[2] and targetBanBoxRefs[2].Text or "",
 		targetBanText3 = targetBanBoxRefs[3] and targetBanBoxRefs[3].Text or "",
 		targetBanText4 = targetBanBoxRefs[4] and targetBanBoxRefs[4].Text or "",
-		targetBanEnabled = targetBanEnabled,
+		targetBanEnabled = banState.targetEnabled,
 		antiBanText1 = antiBanBoxRef[1] and antiBanBoxRef[1].Text or "",
-		antiBanEnabled = antiBanEnabled,
-		ultEspSize = ultEspSize,
-		moveEspSize = moveEspSize,
+		antiBanEnabled = banState.antiEnabled,
+		ultEspSize = espState.ultSize,
+		moveEspSize = espState.moveSize,
 		gojoAfterimageEnabled = gojoAfterimageEnabled,
 		gojoTeleportKey = (getgenv().PiggyMacro and getgenv().PiggyMacro.gtKey and getgenv().PiggyMacro.gtKey.Name) or "None",
 		tripleBlueKey = (getgenv().PiggyMacro and getgenv().PiggyMacro.tbKey and getgenv().PiggyMacro.tbKey.Name) or "None",
 		teleportDelay = getgenv().PiggyMacro and tonumber(getgenv().PiggyMacro.qdelay) or nil,
-		targetEspEnabled = targetEspEnabled,
+		targetEspEnabled = espState.targetEnabled,
 		targetEspSensitivity = targetEspSensitivity,
 		targetEspRange = targetEspRange,
 		pipEnabled = pipCfg.enabled,
@@ -1815,15 +1865,15 @@ function ConfigManager.load(name)
 	if data.flyKey then flyKey = decodeKeybind(data.flyKey, flyKey) end
 	flySpeed = data.flySpeed or 50
 	if flyEnabled then pcall(setFly, true) end
-	headAttachEnabled = data.headAttachEnabled or false
-	if data.headAttachKey then headAttachKey = decodeKeybind(data.headAttachKey, headAttachKey) end
-	headAttachOffset = tonumber(data.headAttachOffset) or 0
-	hpChainEnabled = data.hpChainEnabled or false
-	sgChainEnabled = data.sgChainEnabled or false
-	moveEspEnabled = data.moveEspEnabled or false
+	hattState.enabled = data.headAttachEnabled or false
+	if data.headAttachKey then hattState.key = decodeKeybind(data.headAttachKey, hattState.key) end
+	hattState.offset = tonumber(data.headAttachOffset) or 0
+	chainState.hpEnabled = data.hpChainEnabled or false
+	chainState.sgEnabled = data.sgChainEnabled or false
+	espState.moveEnabled = data.moveEspEnabled or false
 	ultEspEnabled = data.ultEspEnabled or false
 			arrowsEnabled = data.arrowsEnabled or false
-			moveInputsEnabled = data.moveInputsEnabled or false
+			espState.inputsEnabled = data.moveInputsEnabled or false
 			autoBlockEnabled = data.autoBlockEnabled or false
 	blockTapDelay = data.blockTapDelay or 0.04
 	blockTapDuration = data.blockTapDuration or 0.15
@@ -1833,11 +1883,11 @@ function ConfigManager.load(name)
 	if not airSwingEnabled then _G.airSwingTrack = nil end
 	swingRange = data.swingRange or 18
 	airSwingDelay = data.airSwingDelay or 0.40
-	triggerbotEnabled = data.triggerbotEnabled or data.triggerbot2Enabled or false
-	if data.triggerbotKey then triggerbotKey = decodeKeybind(data.triggerbotKey, triggerbotKey) end
-	if type(data.triggerbotSlot) == "number" then triggerbotSlot = math.clamp(math.floor(data.triggerbotSlot), 1, 4) end
-	if data.triggerbot2Key then triggerbot2Key = decodeKeybind(data.triggerbot2Key, triggerbot2Key) end
-	if type(data.triggerbot2Slot) == "number" then triggerbot2Slot = math.clamp(math.floor(data.triggerbot2Slot), 1, 4) end
+	tbState.enabled = data.triggerbotEnabled or data.triggerbot2Enabled or false
+	if data.triggerbotKey then tbState.key = decodeKeybind(data.triggerbotKey, tbState.key) end
+	if type(data.triggerbotSlot) == "number" then tbState.slot = math.clamp(math.floor(data.triggerbotSlot), 1, 4) end
+	if data.triggerbot2Key then tbState.key2 = decodeKeybind(data.triggerbot2Key, tbState.key2) end
+	if type(data.triggerbot2Slot) == "number" then tbState.slot2 = math.clamp(math.floor(data.triggerbot2Slot), 1, 4) end
 	if data.counterKey then counterKey = decodeKeybind(data.counterKey, counterKey) end
 	if data.autoInfinityKey then autoInfinityKey = decodeKeybind(data.autoInfinityKey, autoInfinityKey) end
 	if data.toggleUIKey then toggleUIKey = decodeKeybind(data.toggleUIKey, toggleUIKey) end
@@ -1845,37 +1895,37 @@ function ConfigManager.load(name)
 	autoInfinityEnabled = data.autoInfinityEnabled or false
 	autoInfinityUnlocked = data.autoInfinityUnlocked or false
 	autoPlayEnabled = data.autoPlayEnabled or false
-	autoSprintEnabled = data.autoSprintEnabled or false
+	autoState.sprintEnabled = data.autoSprintEnabled or false
 	if data.targetBanText1 and targetBanBoxRefs[1] then targetBanBoxRefs[1].Text = data.targetBanText1 end
 	if data.targetBanText2 and targetBanBoxRefs[2] then targetBanBoxRefs[2].Text = data.targetBanText2 end
 	if data.targetBanText3 and targetBanBoxRefs[3] then targetBanBoxRefs[3].Text = data.targetBanText3 end
 	if data.targetBanText4 and targetBanBoxRefs[4] then targetBanBoxRefs[4].Text = data.targetBanText4 end
-	targetBanEnabled = data.targetBanEnabled or false
-	if targetBanEnabled then
-		targetBanCharacters = {}
-		if targetBanBoxRefs[1] and targetBanBoxRefs[1].Text ~= "" then targetBanCharacters[#targetBanCharacters+1] = targetBanBoxRefs[1].Text end
-		if targetBanBoxRefs[2] and targetBanBoxRefs[2].Text ~= "" then targetBanCharacters[#targetBanCharacters+1] = targetBanBoxRefs[2].Text end
-		if targetBanBoxRefs[3] and targetBanBoxRefs[3].Text ~= "" then targetBanCharacters[#targetBanCharacters+1] = targetBanBoxRefs[3].Text end
-		if targetBanBoxRefs[4] and targetBanBoxRefs[4].Text ~= "" then targetBanCharacters[#targetBanCharacters+1] = targetBanBoxRefs[4].Text end
-		targetBanCharIdx = 1
-		lastBannedChars = {}
-		banActioned = false
+	banState.targetEnabled = data.targetBanEnabled or false
+	if banState.targetEnabled then
+		banState.targets = {}
+		if targetBanBoxRefs[1] and targetBanBoxRefs[1].Text ~= "" then banState.targets[#banState.targets+1] = targetBanBoxRefs[1].Text end
+		if targetBanBoxRefs[2] and targetBanBoxRefs[2].Text ~= "" then banState.targets[#banState.targets+1] = targetBanBoxRefs[2].Text end
+		if targetBanBoxRefs[3] and targetBanBoxRefs[3].Text ~= "" then banState.targets[#banState.targets+1] = targetBanBoxRefs[3].Text end
+		if targetBanBoxRefs[4] and targetBanBoxRefs[4].Text ~= "" then banState.targets[#banState.targets+1] = targetBanBoxRefs[4].Text end
+		banState.targetIdx = 1
+		banState.lastBanned = {}
+		banState.targetActioned = false
 		banCooldown = 0
 	end
 	if data.antiBanText1 and antiBanBoxRef[1] then antiBanBoxRef[1].Text = data.antiBanText1 end
-	antiBanEnabled = data.antiBanEnabled or false
-	if antiBanEnabled then
-		antiBanCharacters = {}
-		if antiBanBoxRef[1] and antiBanBoxRef[1].Text ~= "" then antiBanCharacters[#antiBanCharacters+1] = antiBanBoxRef[1].Text end
-		antiBanCharIdx = 1
-		antiBanPhase = "ban"
-		antiBanActioned = false
-		antiBanCooldown = 0
-		antiBanPageIdx = 0
-		antiBanPages = {}
+	banState.antiEnabled = data.antiBanEnabled or false
+	if banState.antiEnabled then
+		banState.antiChars = {}
+		if antiBanBoxRef[1] and antiBanBoxRef[1].Text ~= "" then banState.antiChars[#banState.antiChars+1] = antiBanBoxRef[1].Text end
+		banState.antiIdx = 1
+		banState.antiPhase = "ban"
+		banState.antiActioned = false
+		banState.antiCooldown = 0
+		banState.antiPageIdx = 0
+		banState.antiPages = {}
 	end
-	ultEspSize = data.ultEspSize or 3.0
-	moveEspSize = data.moveEspSize or 2.4
+	espState.ultSize = data.ultEspSize or 3.0
+	espState.moveSize = data.moveEspSize or 2.4
 	gojoAfterimageEnabled = data.gojoAfterimageEnabled or false
 		getgenv().PiggyMacro = getgenv().PiggyMacro or { gtKey = Enum.KeyCode.E, tbKey = Enum.KeyCode.V, qdelay = 0.1 }
 		do
@@ -1885,7 +1935,7 @@ function ConfigManager.load(name)
 			PM.tbKey = decodeKeybind(data.tripleBlueKey, PM.tbKey)
 			if tonumber(data.teleportDelay) then PM.qdelay = tonumber(data.teleportDelay) end
 		end
-	targetEspEnabled = data.targetEspEnabled or false
+	espState.targetEnabled = data.targetEspEnabled or false
 	targetEspSensitivity = data.targetEspSensitivity or 0.25
 	targetEspRange = data.targetEspRange or 180
 	pipCfg.enabled = data.pipEnabled == true
@@ -1895,8 +1945,8 @@ function ConfigManager.load(name)
 	pipCfg.winW = math.clamp(tonumber(data.pipWinW) or 300, 180, 1400)
 	pipCfg.winH = math.clamp(tonumber(data.pipWinH) or 169, 110, 900)
 	pipCfg.target = data.pipTargetName or ""
-	autoInfinityLookSensitivity = data.autoInfinityLookSensitivity or 0.5
-	autoInfinityRayRadius = data.autoInfinityRayRadius or 40
+	aiState.lookSensitivity = data.autoInfinityLookSensitivity or 0.5
+	aiState.rayRadius = data.autoInfinityRayRadius or 40
 	
 	if settingsRefs.guiEnabled then settingsRefs.guiEnabled.Set(guiEnabled) end
 	if settingsRefs.teamCheckEnabled then settingsRefs.teamCheckEnabled.Set(teamCheckEnabled) end
@@ -1908,15 +1958,15 @@ function ConfigManager.load(name)
 	if settingsRefs.flyEnabled then settingsRefs.flyEnabled.Set(flyEnabled) end
 	if settingsRefs.flyKey then settingsRefs.flyKey.Set(flyKey) end
 	if settingsRefs.flySpeed then settingsRefs.flySpeed.Set(flySpeed) end
-	if settingsRefs.headAttachEnabled then settingsRefs.headAttachEnabled.Set(headAttachEnabled) end
-	if settingsRefs.headAttachKey then settingsRefs.headAttachKey.Set(headAttachKey) end
-	if settingsRefs.headAttachOffset then settingsRefs.headAttachOffset.Set(headAttachOffset) end
-	if settingsRefs.hpChainEnabled then settingsRefs.hpChainEnabled.Set(hpChainEnabled) end
-	if settingsRefs.sgChainEnabled then settingsRefs.sgChainEnabled.Set(sgChainEnabled) end
-	if settingsRefs.moveEspEnabled then settingsRefs.moveEspEnabled.Set(moveEspEnabled) end
+	if settingsRefs.headAttachEnabled then settingsRefs.headAttachEnabled.Set(hattState.enabled) end
+	if settingsRefs.headAttachKey then settingsRefs.headAttachKey.Set(hattState.key) end
+	if settingsRefs.headAttachOffset then settingsRefs.headAttachOffset.Set(hattState.offset) end
+	if settingsRefs.hpChainEnabled then settingsRefs.hpChainEnabled.Set(chainState.hpEnabled) end
+	if settingsRefs.sgChainEnabled then settingsRefs.sgChainEnabled.Set(chainState.sgEnabled) end
+	if settingsRefs.moveEspEnabled then settingsRefs.moveEspEnabled.Set(espState.moveEnabled) end
 	if settingsRefs.ultEspEnabled then settingsRefs.ultEspEnabled.Set(ultEspEnabled) end
 			if settingsRefs.arrowsEnabled then settingsRefs.arrowsEnabled.Set(arrowsEnabled) end
-			if settingsRefs.moveInputsEnabled then settingsRefs.moveInputsEnabled.Set(moveInputsEnabled) end
+			if settingsRefs.moveInputsEnabled then settingsRefs.moveInputsEnabled.Set(espState.inputsEnabled) end
 			if settingsRefs.autoBlockEnabled then settingsRefs.autoBlockEnabled.Set(autoBlockEnabled) end
 	if settingsRefs.blockTapDelay then settingsRefs.blockTapDelay.Set(blockTapDelay) end
 	if settingsRefs.blockTapDuration then settingsRefs.blockTapDuration.Set(blockTapDuration) end
@@ -1925,32 +1975,32 @@ function ConfigManager.load(name)
  	if settingsRefs.airSwingDelay then settingsRefs.airSwingDelay.Set(airSwingDelay) end
 	if settingsRefs.autoCounterEnabled then settingsRefs.autoCounterEnabled.Set(autoCounterEnabled) end
 	if settingsRefs.airSwing then settingsRefs.airSwing.Set(airSwingEnabled) end
-	if settingsRefs.triggerbotEnabled then settingsRefs.triggerbotEnabled.Set(triggerbotEnabled) end
-	if settingsRefs.triggerbotKey then settingsRefs.triggerbotKey.Set(triggerbotKey) end
-	if settingsRefs.triggerbotSlot then settingsRefs.triggerbotSlot.Set(triggerbotSlot) end
-	if settingsRefs.triggerbot2Key then settingsRefs.triggerbot2Key.Set(triggerbot2Key) end
-	if settingsRefs.triggerbot2Slot then settingsRefs.triggerbot2Slot.Set(triggerbot2Slot) end
+	if settingsRefs.triggerbotEnabled then settingsRefs.triggerbotEnabled.Set(tbState.enabled) end
+	if settingsRefs.triggerbotKey then settingsRefs.triggerbotKey.Set(tbState.key) end
+	if settingsRefs.triggerbotSlot then settingsRefs.triggerbotSlot.Set(tbState.slot) end
+	if settingsRefs.triggerbot2Key then settingsRefs.triggerbot2Key.Set(tbState.key2) end
+	if settingsRefs.triggerbot2Slot then settingsRefs.triggerbot2Slot.Set(tbState.slot2) end
 	if settingsRefs.counterKey then settingsRefs.counterKey.Set(counterKey) end
 	if settingsRefs.autoInfinityKey then settingsRefs.autoInfinityKey.Set(autoInfinityKey) end
 	if settingsRefs.toggleUIKey then settingsRefs.toggleUIKey.Set(toggleUIKey) end
 	if settingsRefs.autoInfinityUnlocked then settingsRefs.autoInfinityUnlocked.Set(autoInfinityUnlocked) end
 	if settingsRefs.autoBlackFlashEnabled then settingsRefs.autoBlackFlashEnabled.Set(autoBlackFlashEnabled) end
 	if settingsRefs.autoPlayEnabled then settingsRefs.autoPlayEnabled.Set(autoPlayEnabled) end
-	if settingsRefs.targetBanEnabled then settingsRefs.targetBanEnabled.Set(targetBanEnabled) end
-	if settingsRefs.antiBanEnabled then settingsRefs.antiBanEnabled.Set(antiBanEnabled) end
+	if settingsRefs.targetBanEnabled then settingsRefs.targetBanEnabled.Set(banState.targetEnabled) end
+	if settingsRefs.antiBanEnabled then settingsRefs.antiBanEnabled.Set(banState.antiEnabled) end
 	if settingsRefs.gojoAfterimageEnabled then settingsRefs.gojoAfterimageEnabled.Set(gojoAfterimageEnabled) end
 	if getgenv().PiggyMacro then
 		if settingsRefs.gojoTeleportKey then settingsRefs.gojoTeleportKey.Set(getgenv().PiggyMacro.gtKey) end
 		if settingsRefs.tripleBlueKey then settingsRefs.tripleBlueKey.Set(getgenv().PiggyMacro.tbKey) end
 		if settingsRefs.teleportDelay then settingsRefs.teleportDelay.Set(getgenv().PiggyMacro.qdelay) end
 	end
-	if settingsRefs.targetEspEnabled then settingsRefs.targetEspEnabled.Set(targetEspEnabled) end
+	if settingsRefs.targetEspEnabled then settingsRefs.targetEspEnabled.Set(espState.targetEnabled) end
 	if settingsRefs.targetEspSensitivity then settingsRefs.targetEspSensitivity.Set(targetEspSensitivity) end
 	if settingsRefs.targetEspRange then settingsRefs.targetEspRange.Set(targetEspRange) end
-	if settingsRefs.autoInfinityLookSensitivity then settingsRefs.autoInfinityLookSensitivity.Set(autoInfinityLookSensitivity) end
-	if settingsRefs.autoInfinityRayRadius then settingsRefs.autoInfinityRayRadius.Set(autoInfinityRayRadius) end
-	if settingsRefs.ultEspSize then settingsRefs.ultEspSize.Set(ultEspSize) end
-	if settingsRefs.moveEspSize then settingsRefs.moveEspSize.Set(moveEspSize) end
+	if settingsRefs.autoInfinityLookSensitivity then settingsRefs.autoInfinityLookSensitivity.Set(aiState.lookSensitivity) end
+	if settingsRefs.autoInfinityRayRadius then settingsRefs.autoInfinityRayRadius.Set(aiState.rayRadius) end
+	if settingsRefs.ultEspSize then settingsRefs.ultEspSize.Set(espState.ultSize) end
+	if settingsRefs.moveEspSize then settingsRefs.moveEspSize.Set(espState.moveSize) end
 	-- Player PiP: restore the saved target first, then the switch
 	if pipCfg.setTarget and pipCfg.target ~= "" then pcall(pipCfg.setTarget, pipCfg.target) end
 	if settingsRefs.pipEnabled then settingsRefs.pipEnabled.Set(pipCfg.enabled) end
@@ -2232,7 +2282,7 @@ do -- Lock dropdown: Off / Camera / Silent (single selector replaces the old tog
     lockFrame.Size = UDim2.new(1, 0, 0, 32)
     lockFrame.Position = UDim2.new(0, 0, 0, 10)
     lockFrame.BackgroundTransparency = 1
-    lockFrame.Parent = mainTabFrame
+    lockFrame.Parent = tabFrames.main
 
     local modeLabel = Instance.new("TextLabel")
     modeLabel.Size = UDim2.new(1, -120, 1, 0)
@@ -2321,23 +2371,23 @@ do -- Lock dropdown: Off / Camera / Silent (single selector replaces the old tog
     }
 end
 
-settingsRefs.teamCheckEnabled = createToggle(mainTabFrame, "Team Check", 50, teamCheckEnabled, function(state)
+settingsRefs.teamCheckEnabled = createToggle(tabFrames.main, "Team Check", 50, teamCheckEnabled, function(state)
     teamCheckEnabled = state
 end)
 
-settingsRefs.predictionEnabled = createToggle(mainTabFrame, "Prediction", 90, predictionEnabled, function(state)
+settingsRefs.predictionEnabled = createToggle(tabFrames.main, "Prediction", 90, predictionEnabled, function(state)
     predictionEnabled = state
 end)
 
-settingsRefs.predictionStrength = createSlider(mainTabFrame, "Prediction Strength", 130, 0, 0.5, predictionStrength, function(val)
+settingsRefs.predictionStrength = createSlider(tabFrames.main, "Prediction Strength", 130, 0, 0.5, predictionStrength, function(val)
     predictionStrength = val
 end)
 
-settingsRefs.smoothness = createSlider(mainTabFrame, "Smoothness", 182, 0.05, 1.0, smoothness, function(val)
+settingsRefs.smoothness = createSlider(tabFrames.main, "Smoothness", 182, 0.05, 1.0, smoothness, function(val)
     smoothness = val
 end)
 
-settingsRefs.lockKey = createKeybind(mainTabFrame, "Lock Keybind", 238, lockKey, function(key)
+settingsRefs.lockKey = createKeybind(tabFrames.main, "Lock Keybind", 238, lockKey, function(key)
     lockKey = key
 end)
 
@@ -2365,16 +2415,16 @@ setFly = function(on)
 	flyVel.Parent = hrp
 end
 
-flyToggleObj = createToggle(rageTabFrame, "Fly", 10, flyEnabled, function(state)
+flyToggleObj = createToggle(tabFrames.rage, "Fly", 10, flyEnabled, function(state)
     setFly(state)
 end)
 settingsRefs.flyEnabled = flyToggleObj
 
-settingsRefs.flyKey = createKeybind(rageTabFrame, "Fly Keybind", 48, flyKey, function(key)
+settingsRefs.flyKey = createKeybind(tabFrames.rage, "Fly Keybind", 48, flyKey, function(key)
     flyKey = key
 end)
 
-settingsRefs.flySpeed = createSlider(rageTabFrame, "Fly Speed", 86, 10, 200, flySpeed, function(val)
+settingsRefs.flySpeed = createSlider(tabFrames.rage, "Fly Speed", 86, 10, 200, flySpeed, function(val)
     flySpeed = val
 end, function(text, val)
     return text .. ": " .. string.format("%.0f", val)
@@ -2382,7 +2432,7 @@ end)
 
 table.insert(connections, RunService.Heartbeat:Connect(function()
 	if not flyEnabled then return end
-	if headAttachFlying then return end -- HeadAttach owns the root while sticking
+	if hattState.flying then return end -- HeadAttach owns the root while sticking
 	local char = LocalPlayer.Character
 	local hrp = char and char:FindFirstChild("HumanoidRootPart")
 	local hum = char and char:FindFirstChildOfClass("Humanoid")
@@ -2415,14 +2465,14 @@ table.insert(connections, LocalPlayer.CharacterAdded:Connect(function()
 end))
 
 -- RAGE TAB (Head Attach, ported from headride.luau: hold key to stick above whoever you're looking at)
-headAttachToggleObj = createToggle(rageTabFrame, "Head Attach", 140, headAttachEnabled, function(state)
-    headAttachEnabled = state
+hattState.toggleObj = createToggle(tabFrames.rage, "Head Attach", 140, hattState.enabled, function(state)
+    hattState.enabled = state
     if not state then
-        headAttachHolding = false
-        headAttachCurrent = nil
-        headAttachOffsetDir = nil
-        if headAttachFlying then
-            headAttachFlying = false
+        hattState.holding = false
+        hattState.current = nil
+        hattState.offsetDir = nil
+        if hattState.flying then
+            hattState.flying = false
             pcall(function()
                 local c = LocalPlayer.Character
                 local h = c and c:FindFirstChildOfClass("Humanoid")
@@ -2431,14 +2481,14 @@ headAttachToggleObj = createToggle(rageTabFrame, "Head Attach", 140, headAttachE
         end
     end
 end)
-settingsRefs.headAttachEnabled = headAttachToggleObj
+settingsRefs.headAttachEnabled = hattState.toggleObj
 
-settingsRefs.headAttachKey = createKeybind(rageTabFrame, "Head Attach Keybind", 178, headAttachKey, function(key)
-    headAttachKey = key
+settingsRefs.headAttachKey = createKeybind(tabFrames.rage, "Head Attach Keybind", 178, hattState.key, function(key)
+    hattState.key = key
 end)
 
-settingsRefs.headAttachOffset = createSlider(rageTabFrame, "Head Attach Offset", 216, 0, 12, headAttachOffset, function(val)
-    headAttachOffset = val
+settingsRefs.headAttachOffset = createSlider(tabFrames.rage, "Head Attach Offset", 216, 0, 12, hattState.offset, function(val)
+    hattState.offset = val
 end, function(text, val)
     return text .. ": " .. string.format("%.0f", val)
 end)
@@ -2458,14 +2508,14 @@ local function headAttachValid(head, myRoot)
     local m = head.Parent
     local h = m and m:FindFirstChildOfClass("Humanoid")
     if not h or h.Health <= 0 then return false end
-    if (head.Position - myRoot.Position).Magnitude > HEAD_ATTACH_MAX_RANGE then return false end
+    if (head.Position - myRoot.Position).Magnitude > hattState.maxRange then return false end
     return true
 end
 
 local function headAttachScoreOf(head, camPos, lookVec, myRoot)
     local to = head.Position - camPos
     if to.Magnitude <= 0 then return math.huge end
-    return (lookVec - to.Unit).Magnitude + ((head.Position - myRoot.Position).Magnitude / HEAD_ATTACH_MAX_RANGE)
+    return (lookVec - to.Unit).Magnitude + ((head.Position - myRoot.Position).Magnitude / hattState.maxRange)
 end
 
 local function headAttachIsTarget(m)
@@ -2478,24 +2528,24 @@ local function headAttachGoal()
     local live = workspace:FindFirstChild("Live")
     local mr = headAttachRoot()
     local cam = Camera
-    if not live or not mr or not cam then headAttachCurrent = nil return nil end
+    if not live or not mr or not cam then hattState.current = nil return nil end
     local camPos = cam.CFrame.Position
     local look = cam.CFrame.LookVector
-    if headAttachValid(headAttachCurrent, mr) then
-        local curScore = headAttachScoreOf(headAttachCurrent, camPos, look, mr)
+    if headAttachValid(hattState.current, mr) then
+        local curScore = headAttachScoreOf(hattState.current, camPos, look, mr)
         local best, bestScore = nil, math.huge
         for _, m in ipairs(live:GetChildren()) do
             if headAttachIsTarget(m) then
                 local head = m:FindFirstChild("Head") or m:FindFirstChild("HumanoidRootPart")
-                if head ~= headAttachCurrent and headAttachValid(head, mr) then
+                if head ~= hattState.current and headAttachValid(head, mr) then
                     local s = headAttachScoreOf(head, camPos, look, mr)
                     if s < bestScore then best, bestScore = head, s end
                 end
             end
         end
         -- only steal focus if clearly better (kills frame-to-frame flicker)
-        if best and bestScore < curScore * HEAD_ATTACH_SWITCH_MARGIN then headAttachCurrent = best end
-        return headAttachCurrent
+        if best and bestScore < curScore * hattState.switchMargin then hattState.current = best end
+        return hattState.current
     end
     local best, bestScore = nil, math.huge
     for _, m in ipairs(live:GetChildren()) do
@@ -2505,34 +2555,34 @@ local function headAttachGoal()
             if h and h.Health > 0 and head then
                 local myDist = (head.Position - mr.Position).Magnitude
                 -- range limit is measured from YOU to the target
-                if myDist > HEAD_ATTACH_MAX_RANGE then continue end
+                if myDist > hattState.maxRange then continue end
                 local to = head.Position - camPos
                 local dist = to.Magnitude
                 if dist > 0 then
                     -- blend: camera-centering + closeness to you (both matter)
-                    local score = (look - to.Unit).Magnitude + (myDist / HEAD_ATTACH_MAX_RANGE)
+                    local score = (look - to.Unit).Magnitude + (myDist / hattState.maxRange)
                     if score < bestScore then best, bestScore = head, score end
                 end
             end
         end
     end
-    headAttachCurrent = best
+    hattState.current = best
     return best
 end
 
 table.insert(connections, RunService.Heartbeat:Connect(function()
     local hrp, h = headAttachRoot(), headAttachHum()
     if not hrp or not h then return end
-    if headAttachEnabled and headAttachHolding and headAttachKey then
+    if hattState.enabled and hattState.holding and hattState.key then
         local head = headAttachGoal()
         if not head then
             -- nothing in range/sight: stay fully normal, never freeze mid-air
-            if headAttachFlying then headAttachFlying = false h.PlatformStand = false end
+            if hattState.flying then hattState.flying = false h.PlatformStand = false end
             return
         end
-        if not headAttachFlying then headAttachFlying = true h.PlatformStand = true end
-        local base = head.Position + Vector3.new(0, HEAD_ATTACH_ABOVE, 0)
-        if headAttachOffset > 0.01 then
+        if not hattState.flying then hattState.flying = true h.PlatformStand = true end
+        local base = head.Position + Vector3.new(0, hattState.above, 0)
+        if hattState.offset > 0.01 then
             -- Offset to the far side of the target along the direction WE are
             -- looking (camera-anchored). The old position-anchored version
             -- (us-to-target vector) flipped the goal to the opposite side
@@ -2543,19 +2593,19 @@ table.insert(connections, RunService.Heartbeat:Connect(function()
             local camLook = Camera and Camera.CFrame.LookVector or nil
             local dir = camLook and Vector3.new(camLook.X, 0, camLook.Z) or nil
             if dir and dir.Magnitude > 0.2 then
-                headAttachOffsetDir = dir.Unit
+                hattState.offsetDir = dir.Unit
             else
                 local away = head.Position - hrp.Position
                 away = Vector3.new(away.X, 0, away.Z)
                 if away.Magnitude > 0.5 then
-                    headAttachOffsetDir = away.Unit
+                    hattState.offsetDir = away.Unit
                 end
             end
-            if headAttachOffsetDir then
-                base = base + headAttachOffsetDir * headAttachOffset
+            if hattState.offsetDir then
+                base = base + hattState.offsetDir * hattState.offset
             end
         else
-            headAttachOffsetDir = nil
+            hattState.offsetDir = nil
         end
         local d = (base - hrp.Position).Magnitude
         hrp.AssemblyLinearVelocity = Vector3.zero
@@ -2563,16 +2613,16 @@ table.insert(connections, RunService.Heartbeat:Connect(function()
         -- organic layer: breathe vertically always, arc sideways while traveling.
         -- both fade with closeness so the final sit-down is still exact.
         local t = os.clock()
-        local closeK = math.clamp(d / HEAD_ATTACH_STICK_DIST, 0, 1)
-        local bob = math.sin(t * HEAD_ATTACH_BOB_SPEED) * HEAD_ATTACH_BOB * (0.4 + 0.6 * (1 - closeK))
+        local closeK = math.clamp(d / hattState.stickDist, 0, 1)
+        local bob = math.sin(t * hattState.bobSpeed) * hattState.bob * (0.4 + 0.6 * (1 - closeK))
         local camR = Camera and Camera.CFrame.RightVector or Vector3.xAxis
-        local sway = math.sin(t * HEAD_ATTACH_SWAY_SPEED) * HEAD_ATTACH_SWAY * closeK
+        local sway = math.sin(t * hattState.swaySpeed) * hattState.sway * closeK
         local goal = base + Vector3.new(0, bob, 0) + camR * sway
-        if d < HEAD_ATTACH_DEADZONE then goal = base + Vector3.new(0, bob * 0.5, 0) end
-        local a = d < HEAD_ATTACH_STICK_DIST and HEAD_ATTACH_STICK or HEAD_ATTACH_CHASE
+        if d < hattState.deadzone then goal = base + Vector3.new(0, bob * 0.5, 0) end
+        local a = d < hattState.stickDist and hattState.stick or hattState.chase
         hrp.CFrame = hrp.CFrame:Lerp(CFrame.new(goal, goal + hrp.CFrame.LookVector), a)
-    elseif headAttachFlying then
-        headAttachFlying = false
+    elseif hattState.flying then
+        hattState.flying = false
         h.PlatformStand = false
     end
 end))
@@ -2580,14 +2630,14 @@ end))
 table.insert(connections, UserInputService.InputBegan:Connect(function(input, gp)
     if gp then return end
     if UserInputService:GetFocusedTextBox() then return end
-    if headAttachEnabled and headAttachKey and input.KeyCode == headAttachKey then
-        headAttachHolding = true
+    if hattState.enabled and hattState.key and input.KeyCode == hattState.key then
+        hattState.holding = true
     end
 end))
 
 table.insert(connections, UserInputService.InputEnded:Connect(function(input)
-    if headAttachKey and input.KeyCode == headAttachKey then
-        headAttachHolding = false
+    if hattState.key and input.KeyCode == hattState.key then
+        hattState.holding = false
     end
 end))
 
@@ -2596,10 +2646,10 @@ table.insert(connections, LocalPlayer.CharacterAdded:Connect(function()
 	if flyEnabled then setFly(true) end
 end))
 table.insert(connections, LocalPlayer.CharacterAdded:Connect(function()
-	headAttachHolding = false
-	headAttachFlying = false
-	headAttachCurrent = nil
-	headAttachOffsetDir = nil
+	hattState.holding = false
+	hattState.flying = false
+	hattState.current = nil
+	hattState.offsetDir = nil
 end))
 
 -- CHARACTERS TAB (per-character move tech, one toggle per row like other tabs).
@@ -2613,35 +2663,35 @@ local function makeCharsHeader(text, yPos)
 	lbl.TextColor3 = Color3.fromRGB(255, 105, 180)
 	lbl.TextSize = 12
 	lbl.Font = Enum.Font.GothamBold
-	lbl.Parent = charactersTabFrame
+	lbl.Parent = tabFrames.chars
 	return lbl
 end
 
 makeCharsHeader("Gojo", 10)
-hpChainToggleObj = createToggle(charactersTabFrame, "Hollow Purple chain", 32, hpChainEnabled, function(state)
-	hpChainEnabled = state
+chainState.hpToggle = createToggle(tabFrames.chars, "Hollow Purple chain", 32, chainState.hpEnabled, function(state)
+	chainState.hpEnabled = state
 end)
-settingsRefs.hpChainEnabled = hpChainToggleObj
+settingsRefs.hpChainEnabled = chainState.hpToggle
 
-settingsRefs.gojoAfterimageEnabled = createToggle(charactersTabFrame, "Gojo afterimage (SAFETY HAZARD)", 68, gojoAfterimageEnabled, function(state)
+settingsRefs.gojoAfterimageEnabled = createToggle(tabFrames.chars, "Gojo afterimage (SAFETY HAZARD)", 68, gojoAfterimageEnabled, function(state)
     gojoAfterimageEnabled = state
 end)
 
 do -- Gojo macro binds (ported from message version misc tab): Triple Blue + Gojo Teleport. Unbound = off.
 	getgenv().PiggyMacro = getgenv().PiggyMacro or { gtKey = Enum.KeyCode.E, tbKey = Enum.KeyCode.V, qdelay = 0.09 }
-    local gtk = createKeybind(charactersTabFrame, "Triple Blue", 104, getgenv().PiggyMacro.gtKey, function(key)
+    local gtk = createKeybind(tabFrames.chars, "Triple Blue", 104, getgenv().PiggyMacro.gtKey, function(key)
         getgenv().PiggyMacro.gtKey = key
     end)
     settingsRefs.gojoTeleportKey = { Set = function(key)
         getgenv().PiggyMacro.gtKey = key gtk.Set(key)
     end }
-    local ttk = createKeybind(charactersTabFrame, "Gojo Teleport", 140, getgenv().PiggyMacro.tbKey, function(key)
+    local ttk = createKeybind(tabFrames.chars, "Gojo Teleport", 140, getgenv().PiggyMacro.tbKey, function(key)
         getgenv().PiggyMacro.tbKey = key
     end)
     settingsRefs.tripleBlueKey = { Set = function(key)
         getgenv().PiggyMacro.tbKey = key ttk.Set(key)
     end }
-    local tsl = createSlider(charactersTabFrame, "Teleport Delay", 176, 0.0, 0.5, getgenv().PiggyMacro.qdelay or 0.09, function(val)
+    local tsl = createSlider(tabFrames.chars, "Teleport Delay", 176, 0.0, 0.5, getgenv().PiggyMacro.qdelay or 0.09, function(val)
         getgenv().PiggyMacro.qdelay = val
     end, function(text, val)
         return text .. ": " .. string.format("%.0f ms", val * 1000)
@@ -2655,10 +2705,10 @@ do -- Gojo macro binds (ported from message version misc tab): Triple Blue + Goj
 end
 
 makeCharsHeader("Yusuke", 228)
-sgChainToggleObj = createToggle(charactersTabFrame, "Spirit Gun chain", 250, sgChainEnabled, function(state)
-	sgChainEnabled = state
+chainState.sgToggle = createToggle(tabFrames.chars, "Spirit Gun chain", 250, chainState.sgEnabled, function(state)
+	chainState.sgEnabled = state
 end)
-settingsRefs.sgChainEnabled = sgChainToggleObj
+settingsRefs.sgChainEnabled = chainState.sgToggle
 
 -- Hollow Purple chain core (ported from hollow_purple.luau). Single persistent
 -- Thrown listener, armed once here; the toggle only gates steering.
@@ -2733,23 +2783,23 @@ task.spawn(function()
 	if not thrown then return end
 	table.insert(connections, thrown.ChildAdded:Connect(function(c)
 	if c.Name ~= "Ball" then return end
-	if not hpChainEnabled then return end
-	if hpBallSize(c) < HP_MIN_BALL_SIZE then return end
+	if not chainState.hpEnabled then return end
+	if hpBallSize(c) < chainState.hpMinSize then return end
 	local char = LocalPlayer.Character
 	local hrp0 = char and char:FindFirstChild("HumanoidRootPart")
 	if not hrp0 then return end
 	local near = false
 	pcall(function()
-		near = (c.Position - hrp0.Position).Magnitude < HP_OWN_SHOT_RADIUS
+		near = (c.Position - hrp0.Position).Magnitude < chainState.hpOwnRadius
 	end)
 	if not near then return end
 	task.spawn(function()
-		task.wait(HP_ARM_DELAY)
+		task.wait(chainState.hpArmDelay)
 		if not c.Parent then return end
-		local list = hpLivingDummiesNear(c.Position, HP_CHAIN_RADIUS)
+		local list = hpLivingDummiesNear(c.Position, chainState.hpRadius)
 		for _, entry in ipairs(list) do
 			if not c.Parent then break end
-			if not hpChainEnabled then break end
+			if not chainState.hpEnabled then break end
 			pcall(function()
 				local m = entry.model
 				local hrp = m:FindFirstChild("HumanoidRootPart")
@@ -2759,17 +2809,17 @@ task.spawn(function()
 					hpZeroMovers(c)
 				end
 			end)
-			task.wait(HP_CHAIN_DELAY)
+			task.wait(chainState.hpDelay)
 		end
 		local RunService = game:GetService("RunService")
 		local speed = 250
 		local conn
 		conn = RunService.Heartbeat:Connect(function()
 			if not c.Parent then conn:Disconnect() return end
-			if not hpChainEnabled then conn:Disconnect() return end
+			if not chainState.hpEnabled then conn:Disconnect() return end
 			pcall(function()
 				if c.Anchored then return end
-				local target = hpLivingDummiesNear(c.Position, HP_CHAIN_RADIUS)[1]
+				local target = hpLivingDummiesNear(c.Position, chainState.hpRadius)[1]
 				if target then
 					local tp = target.model.HumanoidRootPart.Position
 					local dir = tp - c.Position
@@ -2793,18 +2843,18 @@ task.spawn(function()
 	if not thrown then return end
 	table.insert(connections, thrown.ChildAdded:Connect(function(c)
 	if c.Name ~= "Ball" then return end
-	if not sgChainEnabled then return end
-	if hpBallSize(c) >= SG_MAX_BALL_SIZE then return end
+	if not chainState.sgEnabled then return end
+	if hpBallSize(c) >= chainState.sgMaxSize then return end
 	local char = LocalPlayer.Character
 	local hrp0 = char and char:FindFirstChild("HumanoidRootPart")
 	if not hrp0 then return end
 	local near = false
 	pcall(function()
-		near = (c.Position - hrp0.Position).Magnitude < SG_OWN_SHOT_RADIUS
+		near = (c.Position - hrp0.Position).Magnitude < chainState.sgOwnRadius
 	end)
 	if not near then return end
 	task.spawn(function()
-		task.wait(SG_ARM_DELAY)
+		task.wait(chainState.sgArmDelay)
 		if not c.Parent then return end
 		local bv = c:FindFirstChildOfClass("BodyVelocity")
 		if bv then
@@ -2817,10 +2867,10 @@ task.spawn(function()
 			if bv then speed = bv.Velocity.Magnitude end
 		end)
 		if speed < 50 then speed = 180 end
-		local list = hpLivingDummiesNear(c.Position, SG_CHAIN_RADIUS)
+		local list = hpLivingDummiesNear(c.Position, chainState.sgRadius)
 		for _, entry in ipairs(list) do
 			if not c.Parent then break end
-			if not sgChainEnabled then break end
+			if not chainState.sgEnabled then break end
 			pcall(function()
 				local m = entry.model
 				local hrp = m:FindFirstChild("HumanoidRootPart")
@@ -2831,10 +2881,10 @@ task.spawn(function()
 					if b2 then b2.Velocity = Vector3.new(0, 0, 0) end
 				end
 			end)
-			task.wait(SG_CHAIN_DELAY)
+			task.wait(chainState.sgDelay)
 		end
 		if c.Parent and bv and bv.Parent then
-			local nt = hpLivingDummiesNear(c.Position, SG_CHAIN_RADIUS)[1]
+			local nt = hpLivingDummiesNear(c.Position, chainState.sgRadius)[1]
 			if nt then
 				pcall(function()
 					bv.Velocity = ((nt.model.HumanoidRootPart.Position - c.Position).Unit) * speed
@@ -2849,11 +2899,11 @@ task.spawn(function()
 		local conn
 		conn = RunService.Heartbeat:Connect(function()
 			if not c.Parent then conn:Disconnect() return end
-			if not sgChainEnabled then conn:Disconnect() return end
+			if not chainState.sgEnabled then conn:Disconnect() return end
 			pcall(function()
 				local b3 = c:FindFirstChildOfClass("BodyVelocity")
 				if not b3 then return end
-				local target = hpLivingDummiesNear(c.Position, SG_CHAIN_RADIUS)[1]
+				local target = hpLivingDummiesNear(c.Position, chainState.sgRadius)[1]
 				if target then
 					local tp = target.model.HumanoidRootPart.Position + Vector3.new(0, 1, 0)
 					local dir = tp - c.Position
@@ -2869,8 +2919,8 @@ end))
 end)
 
 -- ESP TAB (Move ESP, Ult ESP, Offscreen arrows, Move inputs)
-settingsRefs.moveEspEnabled = createToggle(espTabFrame, "Move ESP", 10, moveEspEnabled, function(state)
-    moveEspEnabled = state
+settingsRefs.moveEspEnabled = createToggle(tabFrames.esp, "Move ESP", 10, espState.moveEnabled, function(state)
+    espState.moveEnabled = state
 	if state then
 		for _, player in ipairs(Players:GetPlayers()) do
 			if player ~= LocalPlayer and player.Character then
@@ -2888,7 +2938,7 @@ settingsRefs.moveEspEnabled = createToggle(espTabFrame, "Move ESP", 10, moveEspE
 	end
 end)
 
-settingsRefs.ultEspEnabled = createToggle(espTabFrame, "Ult ESP", 90, ultEspEnabled, function(state)
+settingsRefs.ultEspEnabled = createToggle(tabFrames.esp, "Ult ESP", 90, ultEspEnabled, function(state)
     ultEspEnabled = state
 	if not state then
 		for _, player in ipairs(Players:GetPlayers()) do
@@ -2898,52 +2948,52 @@ settingsRefs.ultEspEnabled = createToggle(espTabFrame, "Ult ESP", 90, ultEspEnab
 	end
 end)
 
-settingsRefs.arrowsEnabled = createToggle(espTabFrame, "Off-Screen Arrows", 130, arrowsEnabled, function(state)
+settingsRefs.arrowsEnabled = createToggle(tabFrames.esp, "Off-Screen Arrows", 130, arrowsEnabled, function(state)
     arrowsEnabled = state
 end)
 
-settingsRefs.targetEspEnabled = createToggle(espTabFrame, "Target ESP", 170, targetEspEnabled, function(state)
-    targetEspEnabled = state
+settingsRefs.targetEspEnabled = createToggle(tabFrames.esp, "Target ESP", 170, espState.targetEnabled, function(state)
+    espState.targetEnabled = state
     if not state then
-        if targetEspBillboard then
-            pcall(function() targetEspBillboard:Destroy() end)
-            targetEspBillboard = nil
+        if espState.targetBillboard then
+            pcall(function() espState.targetBillboard:Destroy() end)
+            espState.targetBillboard = nil
         end
-        targetEspAlertTime = 0
+        espState.targetAlertTime = 0
     end
 end)
 
-settingsRefs.targetEspSensitivity = createSlider(espTabFrame, "Target ESP Sensitivity", 210, 0.05, 0.8, targetEspSensitivity, function(val)
+settingsRefs.targetEspSensitivity = createSlider(tabFrames.esp, "Target ESP Sensitivity", 210, 0.05, 0.8, targetEspSensitivity, function(val)
     targetEspSensitivity = val
 end)
 
-settingsRefs.targetEspRange = createSlider(espTabFrame, "Target ESP Range", 254, 50, 300, targetEspRange, function(val)
+settingsRefs.targetEspRange = createSlider(tabFrames.esp, "Target ESP Range", 254, 50, 300, targetEspRange, function(val)
     targetEspRange = val
 end)
 
-settingsRefs.ultEspSize = createSlider(espTabFrame, "Ult ESP Size", 298, 3.0, 9.0, ultEspSize, function(val)
-	ultEspSize = val
+settingsRefs.ultEspSize = createSlider(tabFrames.esp, "Ult ESP Size", 298, 3.0, 9.0, espState.ultSize, function(val)
+	espState.ultSize = val
 	for _, player in ipairs(Players:GetPlayers()) do
 		local bb = parentGui:FindFirstChild(player.Name .. "_ChargeBillboard")
 		if bb then
-			bb.Size = UDim2.new(ultEspSize, 0, ultEspSize / 3, 0)
-			bb.StudsOffset = Vector3.new(-(ultEspSize + 0.4), 0, ultEspSize / 6)
+			bb.Size = UDim2.new(espState.ultSize, 0, espState.ultSize / 3, 0)
+			bb.StudsOffset = Vector3.new(-(espState.ultSize + 0.4), 0, espState.ultSize / 6)
 		end
 	end
 end)
 
-settingsRefs.moveEspSize = createSlider(espTabFrame, "Move ESP Size", 342, 1.0, 6.0, moveEspSize, function(val)
-	moveEspSize = val
+settingsRefs.moveEspSize = createSlider(tabFrames.esp, "Move ESP Size", 342, 1.0, 6.0, espState.moveSize, function(val)
+	espState.moveSize = val
 	for _, player in ipairs(Players:GetPlayers()) do
 		local bb = parentGui:FindFirstChild(player.Name .. "_MoveBillboard")
 		if bb then
-			bb.Size = UDim2.new(moveEspSize, 0, 7.2, 0)
+			bb.Size = UDim2.new(espState.moveSize, 0, 7.2, 0)
 		end
 	end
 end)
 
-settingsRefs.moveInputsEnabled = createToggle(espTabFrame, "Move inputs", 50, moveInputsEnabled, function(state)
-    moveInputsEnabled = state
+settingsRefs.moveInputsEnabled = createToggle(tabFrames.esp, "Move inputs", 50, espState.inputsEnabled, function(state)
+    espState.inputsEnabled = state
 	if state then
 		for _, player in ipairs(Players:GetPlayers()) do
 			if player ~= LocalPlayer and player.Character then
@@ -3663,7 +3713,7 @@ end)
 	ddRow.Position = UDim2.new(0, 0, 0, 504)
 	ddRow.BackgroundTransparency = 1
 	ddRow.ZIndex = 20 -- keep the popup above the sliders it opens over
-	ddRow.Parent = espTabFrame
+	ddRow.Parent = tabFrames.esp
 
 	local ddLabel = Instance.new("TextLabel")
 	ddLabel.Size = UDim2.new(1, -160, 1, 0)
@@ -3861,14 +3911,14 @@ end)
 		end
 	end
 
-	local pipToggleRef = createToggle(espTabFrame, "Player PiP", 386, pipCfg.enabled, function(state)
+	local pipToggleRef = createToggle(tabFrames.esp, "Player PiP", 386, pipCfg.enabled, function(state)
 		applyEnabled(state)
 	end)
 	settingsRefs.pipEnabled = pipToggleRef
 
 	local pipAutoturnRef, pipEnemyLockRef
 
-	pipAutoturnRef = createToggle(espTabFrame, "PiP Autoturn", 424, pipCfg.autoturn, function(state)
+	pipAutoturnRef = createToggle(tabFrames.esp, "PiP Autoturn", 424, pipCfg.autoturn, function(state)
 		pipCfg.autoturn = state
 		if state and pipCfg.enemyLock then
 			pipCfg.enemyLock = false
@@ -3877,7 +3927,7 @@ end)
 	end)
 	settingsRefs.pipAutoturn = pipAutoturnRef
 
-	pipEnemyLockRef = createToggle(espTabFrame, "PiP Enemy Lock", 466, pipCfg.enemyLock, function(state)
+	pipEnemyLockRef = createToggle(tabFrames.esp, "PiP Enemy Lock", 466, pipCfg.enemyLock, function(state)
 		pipCfg.enemyLock = state
 		if state then
 			enemyAcc = 1 -- scan on the next frame
@@ -4098,13 +4148,21 @@ end)()
 -- Loads PiggyHub/Database.json once, builds a whitelist of move-trigger anim
 -- ids (the anim present in ~every sample of each move), then constantly scans
 -- enemy animators. When a whitelisted move is detected, presses 4 (Infinity).
-local autoInfinityAnims = {}          -- animId -> move name
-local autoInfinityRecent = {}         -- animIdNum -> last trigger time
-local autoInfinityRecentMove = {}     -- playerName::moveName -> last trigger time
-local autoInfinityScheduled = {}      -- scheduled timed presses { at, move, id, player }
-local autoInfinityProj = {}           -- enemy playerName -> pending proj info { start, launch, speed, id, move }
-local autoInfinityRush = {}           -- enemy playerName -> pending rush info { pos, prev, entry } for velocity confirm
-local autoInfinityCounterMoves = {}   -- profile charName -> {moveName -> true} (moves that got whitelisted)
+-- Auto-Infinity caches + tuning (bundled for register headroom)
+aiState = {
+	anims = {}, -- was autoInfinityAnims
+	recent = {}, -- was autoInfinityRecent
+	recentMove = {}, -- was autoInfinityRecentMove
+	scheduled = {}, -- was autoInfinityScheduled
+	proj = {}, -- was autoInfinityProj
+	rush = {}, -- was autoInfinityRush
+	counterMoves = {}, -- was autoInfinityCounterMoves
+	lead = 0.4, -- was AUTOINFINITY_LEAD
+	rushLead = 0.4, -- was AUTOINFINITY_RUSH_LEAD
+	margin = 0.16, -- was AUTOINFINITY_MARGIN
+	rayRadius = 40, -- was autoInfinityRayRadius
+	lookSensitivity = 0.5, -- was autoInfinityLookSensitivity
+}
 
 -- AutoInfinity-local teammate check (mirrors the main isTeammate helper but
 -- defined before the AutoInfinity heartbeat, which runs earlier in the file).
@@ -4118,11 +4176,6 @@ local function aiIsTeammate(player)
 	end
 	return LocalPlayer.Team == player.Team or LocalPlayer.TeamColor == player.TeamColor
 end
-local AUTOINFINITY_LEAD = 0.4         -- press Infinity this many s before impact
-local AUTOINFINITY_RUSH_LEAD = 0.4    -- extra lead for rushes (short eta + fast close eat the base lead)
-local AUTOINFINITY_MARGIN = 0.16      -- minimum time-to-impact (Infinity windup): skip if nearest to time to respond
-local autoInfinityRayRadius = 40    -- half of the hit zone the aim ray must pass through (Ray cast sensitivity)
-local autoInfinityLookSensitivity = 0.5    -- min enemy facing dot (toward us) required to counter a fixed move; 1 = dead-on
 local function pressInfinityKey()
 	if autoInfinityUnlocked and UserInputService:IsKeyDown(Enum.KeyCode.F) then
 		-- "Infinity unblock": drop the guard first so Infinity isn't
@@ -4142,9 +4195,9 @@ local function pressInfinityKey()
 end
 
 local function autoInfinityLoadDatabase()
-	autoInfinityAnims = {}
-	autoInfinityRecent = {}
-	autoInfinityCounterMoves = {}
+	aiState.anims = {}
+	aiState.recent = {}
+	aiState.counterMoves = {}
 	if not readfile or not isfile then return false, "no readfile" end
 	if not isfile("PiggyHub/Database.json") then return false, "no Database.json" end
 	local ok, data = pcall(readfile, "PiggyHub/Database.json")
@@ -4156,15 +4209,15 @@ local function autoInfinityLoadDatabase()
 	local count = 0
 	local function whitelistAnim(idNum, charName, moveName, gate)
 		-- same anim id can be owned by several chars (ABA reuses assets); merge
-		local existing = autoInfinityAnims[idNum]
+		local existing = aiState.anims[idNum]
 		if existing then
 			existing.chars[charName] = true
 		else
 			gate.chars = { [charName] = true }
-			autoInfinityAnims[idNum] = gate
+			aiState.anims[idNum] = gate
 		end
-		if not autoInfinityCounterMoves[charName] then autoInfinityCounterMoves[charName] = {} end
-		autoInfinityCounterMoves[charName][moveName] = true
+		if not aiState.counterMoves[charName] then aiState.counterMoves[charName] = {} end
+		aiState.counterMoves[charName][moveName] = true
 		count = count + 1
 	end
 	for charName, moves in pairs(db.profiles) do
@@ -4202,7 +4255,7 @@ local reach = prof.range
 					if idNum ~= "" and aName == "Animation" then
 						local freq = a.freq or 0
 						if not best or freq > (best.freq or 0) then best = { idNum = idNum, freq = freq } end
-						if freq >= 0.9 and not autoInfinityAnims[idNum] then
+						if freq >= 0.9 and not aiState.anims[idNum] then
 							whitelistAnim(idNum, charName, moveName, { move = moveName, range = reach, model = pModel, speed = pSpeed, launchDelay = pLaunch, windup = pWindup, windupAvg = pWindupAvg })
 						end
 					end
@@ -4240,7 +4293,7 @@ table.insert(connections, RunService.Heartbeat:Connect(function()
 						local anim = track.Animation
 						if anim and track.IsPlaying then
 							local idNum = (tostring(anim.AnimationId):match("%d+")) or ""
-							local gate = idNum ~= "" and autoInfinityAnims[idNum] or nil
+							local gate = idNum ~= "" and aiState.anims[idNum] or nil
 							-- anim ids are shared across characters (ABA reuses assets),
 							-- so only fire if THIS enemy owns the move the anim was captured for
 							if gate and enemyBase then
@@ -4249,14 +4302,14 @@ table.insert(connections, RunService.Heartbeat:Connect(function()
 								end
 							end
 							if gate then
-								local last = autoInfinityRecent[idNum] or 0
+								local last = aiState.recent[idNum] or 0
 								-- projectile moves schedule a press at time-to-impact; melee/
 								-- fixed moves (no speed) counter immediately. Re-fire is
 								-- allowed every 1.5s per move.
-								local lastMove = autoInfinityRecentMove[player.Name .. "::" .. gate.move] or 0
+								local lastMove = aiState.recentMove[player.Name .. "::" .. gate.move] or 0
 								if now - last >= 1.2 and now - lastMove > 1.5 then
-									autoInfinityRecent[idNum] = now
-									autoInfinityRecentMove[player.Name .. "::" .. gate.move] = now
+									aiState.recent[idNum] = now
+									aiState.recentMove[player.Name .. "::" .. gate.move] = now
 									if dist and dist <= gate.range + 2 then
 										if gate.model == "rush" then
 											-- Dash moves run toward the player, so the enemy's facing
@@ -4267,14 +4320,14 @@ table.insert(connections, RunService.Heartbeat:Connect(function()
 											local along = delta:Dot(aimDir)
 											local closest = origin + aimDir * along
 											local miss = (myRoot.Position - closest).Magnitude
-											if along > 0 and miss <= autoInfinityRayRadius then
+											if along > 0 and miss <= aiState.rayRadius then
 local flight = gate.speed and gate.speed > 0 and (along / gate.speed) or 0
 											local eta = (gate.launchDelay or 0) + flight
 											-- Dash moves (e.g. Detroit Smash) close distance on their own; a
 											-- mis-fit tiny speed would inflate flight far past reality. The
 											-- captured windup is the measured time-to-impact — cap by it.
 											if gate.windupAvg and eta > gate.windupAvg then eta = gate.windupAvg end
-												if eta - AUTOINFINITY_RUSH_LEAD < AUTOINFINITY_MARGIN then
+												if eta - aiState.rushLead < aiState.margin then
 													-- Dash too imminent to schedule a timed lead press: press
 													-- Infinity NOW so it's up before the dash lands (e.g. close
 													-- Detroit Smash where launchDelay fills almost the whole ETA).
@@ -4282,16 +4335,16 @@ local flight = gate.speed and gate.speed > 0 and (along / gate.speed) or 0
 													pressInfinityKey()
 												else
 													local entry = {
-															at = now + math.max(eta - AUTOINFINITY_LEAD - AUTOINFINITY_RUSH_LEAD, 0),
+															at = now + math.max(eta - aiState.lead - aiState.rushLead, 0),
 															move = gate.move,
 															id = idNum,
 															player = player.Name,
 															est = eta,
 															cancelled = false,
 														}
-														table.insert(autoInfinityScheduled, entry)
+														table.insert(aiState.scheduled, entry)
 														-- register for the velocity confirm/cancel tracker below
-														autoInfinityRush[player.Name] = {
+														aiState.rush[player.Name] = {
 															pos = origin,
 															prev = origin,
 															t0 = now,
@@ -4310,7 +4363,7 @@ local flight = gate.speed and gate.speed > 0 and (along / gate.speed) or 0
 											-- beam is mouse-aimed away (body faces us but muzzle goes up/side).
 											local projLookSens = (enemyRoot and myRoot)
 												and (enemyRoot.CFrame.LookVector):Dot((myRoot.Position - enemyRoot.Position).Unit) or 0
-											if projLookSens < autoInfinityLookSensitivity then do end
+											if projLookSens < aiState.lookSensitivity then do end
 											else
 local pSpeed = gate.speed or 0
 											local tSpeed = pSpeed > 0 and pSpeed or 40
@@ -4321,18 +4374,18 @@ local pSpeed = gate.speed or 0
 											-- windup (move-start -> landed health-drop) IS the measured impact
 											-- ETA; never schedule slower than it.
 											if gate.windupAvg and eta > gate.windupAvg then eta = gate.windupAvg end
-												if eta < AUTOINFINITY_MARGIN then do end
+												if eta < aiState.margin then do end
 												else
 													local entry = {
-														at = now + math.max(eta - AUTOINFINITY_LEAD, 0),
+														at = now + math.max(eta - aiState.lead, 0),
 														move = gate.move,
 														id = idNum,
 														player = player.Name,
 														est = travelGuess,
 														cancelled = false,
 													}
-													table.insert(autoInfinityScheduled, entry)
-													autoInfinityProj[player.Name] = {
+													table.insert(aiState.scheduled, entry)
+													aiState.proj[player.Name] = {
 														start = now,
 														flight = eta,
 														id = idNum,
@@ -4354,18 +4407,18 @@ local pSpeed = gate.speed or 0
 											local aimDir = enemyRoot.CFrame.LookVector
 											local toUs = (myRoot.Position - enemyRoot.Position).Unit
 											local facing = aimDir:Dot(toUs)
-											if facing >= autoInfinityLookSensitivity then
+											if facing >= aiState.lookSensitivity then
 												local eta = gate.windup or 0
-												if eta > AUTOINFINITY_LEAD + AUTOINFINITY_MARGIN then
+												if eta > aiState.lead + aiState.margin then
 													local entry = {
-														at = now + math.max(eta - AUTOINFINITY_LEAD, 0),
+														at = now + math.max(eta - aiState.lead, 0),
 														move = gate.move,
 														id = idNum,
 														player = player.Name,
 														est = eta,
 														cancelled = false,
 													}
-													table.insert(autoInfinityScheduled, entry)
+													table.insert(aiState.scheduled, entry)
 													do end
 												else do end
 													pressInfinityKey()
@@ -4403,9 +4456,9 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 	local myPos = myRoot.Position
 
 	-- prune trackers whose parts are gone (no beam ever confirmed/concurremd)
-	for name, info in pairs(autoInfinityProj) do
+	for name, info in pairs(aiState.proj) do
 		if now - info.start > 2.5 then
-			autoInfinityProj[name] = nil
+			aiState.proj[name] = nil
 		end
 	end
 
@@ -4428,7 +4481,7 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 		if muzzle and bestD <= 90 then
 			local eChar = muzzle.Parent
 			local ePlayer = eChar and Players:GetPlayerFromCharacter(eChar)
-			if ePlayer and autoInfinityProj[ePlayer.Name] then
+			if ePlayer and aiState.proj[ePlayer.Name] then
 				local f = far[muzzle]
 				local dM = (pos - muzzle.Position).Magnitude
 				if not f or dM > f.farD then far[muzzle] = { farPos = pos, farD = dM } end
@@ -4441,7 +4494,7 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 		local eChar = muzzle.Parent
 		local ePlayer = eChar and Players:GetPlayerFromCharacter(eChar)
 		if ePlayer then
-			local info = autoInfinityProj[ePlayer.Name]
+			local info = aiState.proj[ePlayer.Name]
 			if info and (now - info.start) < 2.5 then
 				local muzzlePos = muzzle.Position
 				local mDelta = myPos - muzzlePos
@@ -4454,10 +4507,10 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 				local alongM = mDelta:Dot(look)            -- studs from muzzle along aim
 				local closestM = muzzlePos + look * alongM
 				local missM = (myPos - closestM).Magnitude -- studs off the aim ray
-				local cancels = missM > autoInfinityRayRadius or alongM < -4
+				local cancels = missM > aiState.rayRadius or alongM < -4
 				if info.entry then info.entry.cancelled = cancels end
 				do end
-				autoInfinityProj[ePlayer.Name] = nil   -- consumed
+				aiState.proj[ePlayer.Name] = nil   -- consumed
 			end
 		end
 	end
@@ -4476,15 +4529,15 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 	if not myRoot then return end
 	local now = os.clock()
 	-- prune stalls (no movement, enemy was never tracked or dash over)
-	for name, info in pairs(autoInfinityRush) do
-		if info.entry.cancelled or (now - info.t0) > 2.5 then autoInfinityRush[name] = nil end
+	for name, info in pairs(aiState.rush) do
+		if info.entry.cancelled or (now - info.t0) > 2.5 then aiState.rush[name] = nil end
 	end
-	for name, info in pairs(autoInfinityRush) do
+	for name, info in pairs(aiState.rush) do
 		local pl = Players:FindFirstChild(name)
 		local eChar = pl and pl.Character
 		local eRoot = eChar and eChar.Parent and eChar:FindFirstChild("HumanoidRootPart")
 		if not (eRoot and eRoot.Parent) then
-			autoInfinityRush[name] = nil
+			aiState.rush[name] = nil
 		else
 			local cur = eRoot.Position
 			local dx = cur - info.prev
@@ -4499,10 +4552,10 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 				local along = delta:Dot(diru)
 				local closest = origin + diru * along
 				local miss = (myRoot.Position - closest).Magnitude
-				local cancels = along <= 0 or miss > autoInfinityRayRadius
+				local cancels = along <= 0 or miss > aiState.rayRadius
 				info.entry.cancelled = cancels
 				do end
-				autoInfinityRush[name] = nil  -- decided
+				aiState.rush[name] = nil  -- decided
 			end
 		end
 	end
@@ -4513,10 +4566,10 @@ end))
 -- (instead of task.delay) keeps ordering deterministic and prunes stale ones.
 table.insert(connections, RunService.RenderStepped:Connect(function()
 	if not autoInfinityEnabled then return end
-	if #autoInfinityScheduled == 0 then return end
+	if #aiState.scheduled == 0 then return end
 	local now = os.clock()
 	local keep = {}
-	for _, sched in ipairs(autoInfinityScheduled) do
+	for _, sched in ipairs(aiState.scheduled) do
 		if sched.cancelled then
 			-- beam confirmed aimed away -> never press, drop immediately
 		elseif now >= sched.at then do end
@@ -4525,7 +4578,7 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 			keep[#keep + 1] = sched
 		end
 	end
-	autoInfinityScheduled = keep
+	aiState.scheduled = keep
 end))
 
 -- load once at startup (re-loaded when the toggle is switched on)
@@ -4541,29 +4594,29 @@ local function makeMiscHeader(text, yPos)
     lbl.TextColor3 = Color3.fromRGB(255, 105, 180)
     lbl.TextSize = 12
     lbl.Font = Enum.Font.GothamBold
-    lbl.Parent = miscTabFrame
+    lbl.Parent = tabFrames.misc
     return lbl
 end
 
 makeMiscHeader("Blocking", 10)
-settingsRefs.autoBlockEnabled = createToggle(miscTabFrame, "Auto Block", 32, autoBlockEnabled, function(state)
+settingsRefs.autoBlockEnabled = createToggle(tabFrames.misc, "Auto Block", 32, autoBlockEnabled, function(state)
     autoBlockEnabled = state
 end)
 
-settingsRefs.blockTapDelay = createSlider(miscTabFrame, "Block Delay", 68, 0.0, 0.35, blockTapDelay, function(val)
+settingsRefs.blockTapDelay = createSlider(tabFrames.misc, "Block Delay", 68, 0.0, 0.35, blockTapDelay, function(val)
     blockTapDelay = val
 end)
 
-settingsRefs.blockTapDuration = createSlider(miscTabFrame, "Block Hold Time", 116, 0.05, 0.5, blockTapDuration, function(val)
+settingsRefs.blockTapDuration = createSlider(tabFrames.misc, "Block Hold Time", 116, 0.05, 0.5, blockTapDuration, function(val)
     blockTapDuration = val
 end)
 
 makeMiscHeader("Counter", 166)
-autoCounterToggleObj = createToggle(miscTabFrame, "Auto Counter", 188, autoCounterEnabled, function(state)
+autoCounterToggleObj = createToggle(tabFrames.misc, "Auto Counter", 188, autoCounterEnabled, function(state)
     autoCounterEnabled = state
     updateCounterLabel()
 end)
-local airSwingToggleObj = createToggle(miscTabFrame, "Air Swing", 224, airSwingEnabled, function(state)
+local airSwingToggleObj = createToggle(tabFrames.misc, "Air Swing", 224, airSwingEnabled, function(state)
     airSwingEnabled = state
     if not state then
         _G.airSwingTrack = nil
@@ -4573,19 +4626,19 @@ end)
 settingsRefs.autoCounterEnabled = autoCounterToggleObj
 settingsRefs.airSwing = airSwingToggleObj
 
-settingsRefs.swingRange = createSlider(miscTabFrame, "Swing Range", 296, 4, 25, swingRange, function(val)
+settingsRefs.swingRange = createSlider(tabFrames.misc, "Swing Range", 296, 4, 25, swingRange, function(val)
     swingRange = val
 end, function(text, val)
     return text .. ": " .. string.format("%.0f studs", val)
 end)
 
-settingsRefs.airSwingDelay = createSlider(miscTabFrame, "Air Swing Delay", 344, 0.0, 1.0, airSwingDelay, function(val)
+settingsRefs.airSwingDelay = createSlider(tabFrames.misc, "Air Swing Delay", 344, 0.0, 1.0, airSwingDelay, function(val)
     airSwingDelay = val
 end, function(text, val)
     return text .. ": " .. string.format("%.0f ms", val * 1000)
 end)
 
-settingsRefs.counterM1Delay = createSlider(miscTabFrame, "Counter Delay", 392, 0.0, 0.15, counterM1Delay, function(val)
+settingsRefs.counterM1Delay = createSlider(tabFrames.misc, "Counter Delay", 392, 0.0, 0.15, counterM1Delay, function(val)
     counterM1Delay = val
 end, function(text, val)
     return text .. ": " .. string.format("%.0f ms", val * 1000)
@@ -4633,7 +4686,7 @@ local function autoInfinityScanNotice()
 		local parts = {}
 		local collect = function(cn)
 			if not cn or type(cn) ~= "string" then return end
-			local moves = autoInfinityCounterMoves[cn]
+			local moves = aiState.counterMoves[cn]
 			if not moves then return end
 			for name in pairs(moves) do parts[#parts + 1] = name end
 		end
@@ -4678,22 +4731,22 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 	autoInfinityScanNotice()
 end))
 
-settingsRefs.counterKey = createKeybind(miscTabFrame, "Counter Keybind", 260, counterKey, function(key)
+settingsRefs.counterKey = createKeybind(tabFrames.misc, "Counter Keybind", 260, counterKey, function(key)
     counterKey = key
 end)
 
 makeMiscHeader("Triggerbot", 442)
-triggerbotToggleObj = createToggle(miscTabFrame, "Triggerbot", 464, triggerbotEnabled, function(state)
-    triggerbotEnabled = state
+triggerbotToggleObj = createToggle(tabFrames.misc, "Triggerbot", 464, tbState.enabled, function(state)
+    tbState.enabled = state
     if not state then
-        triggerbot1Pending = false
-        triggerbot2Pending = false
+        tbState.pending1 = false
+        tbState.pending2 = false
     end
 end)
 settingsRefs.triggerbotEnabled = triggerbotToggleObj
 
-settingsRefs.triggerbotKey = createKeybind(miscTabFrame, "Move 1 Keybind", 500, triggerbotKey, function(key)
-    triggerbotKey = key
+settingsRefs.triggerbotKey = createKeybind(tabFrames.misc, "Move 1 Keybind", 500, tbState.key, function(key)
+    tbState.key = key
 end)
 
 do -- Move slot dropdown (1-4): determines which move slot triggerbot presses on activation
@@ -4701,7 +4754,7 @@ do -- Move slot dropdown (1-4): determines which move slot triggerbot presses on
     slotFrame.Size = UDim2.new(1, 0, 0, 32)
     slotFrame.Position = UDim2.new(0, 0, 0, 536)
     slotFrame.BackgroundTransparency = 1
-    slotFrame.Parent = miscTabFrame
+    slotFrame.Parent = tabFrames.misc
 
     local slotLabel = Instance.new("TextLabel")
     slotLabel.Size = UDim2.new(1, -120, 1, 0)
@@ -4737,7 +4790,7 @@ do -- Move slot dropdown (1-4): determines which move slot triggerbot presses on
     local dlCorner = Instance.new("UICorner"); dlCorner.CornerRadius = UDim.new(0, 6); dlCorner.Parent = dropList
 
     local function refreshSlotText()
-        dropBtn.Text = "Slot " .. tostring(triggerbotSlot)
+        dropBtn.Text = "Slot " .. tostring(tbState.slot)
     end
 
     for i = 1, 4 do
@@ -4754,7 +4807,7 @@ do -- Move slot dropdown (1-4): determines which move slot triggerbot presses on
         opt.Parent = dropList
         local idx = i
         opt.MouseButton1Click:Connect(function()
-            triggerbotSlot = idx
+            tbState.slot = idx
             refreshSlotText()
             dropList.Visible = false
             autoSaveSettings()
@@ -4774,15 +4827,15 @@ do -- Move slot dropdown (1-4): determines which move slot triggerbot presses on
     settingsRefs.triggerbotSlot = {
         Set = function(val)
             if type(val) == "number" and val >= 1 and val <= 4 then
-                triggerbotSlot = math.floor(val)
+                tbState.slot = math.floor(val)
                 refreshSlotText()
             end
         end
     }
 end
 
-settingsRefs.triggerbot2Key = createKeybind(miscTabFrame, "Move 2 Keybind", 572, triggerbot2Key, function(key)
-    triggerbot2Key = key
+settingsRefs.triggerbot2Key = createKeybind(tabFrames.misc, "Move 2 Keybind", 572, tbState.key2, function(key)
+    tbState.key2 = key
 end)
 
 do -- Move slot 2 dropdown (1-4): second triggerbot channel's move
@@ -4790,7 +4843,7 @@ do -- Move slot 2 dropdown (1-4): second triggerbot channel's move
     slotFrame.Size = UDim2.new(1, 0, 0, 32)
     slotFrame.Position = UDim2.new(0, 0, 0, 608)
     slotFrame.BackgroundTransparency = 1
-    slotFrame.Parent = miscTabFrame
+    slotFrame.Parent = tabFrames.misc
 
     local slotLabel = Instance.new("TextLabel")
     slotLabel.Size = UDim2.new(1, -120, 1, 0)
@@ -4826,7 +4879,7 @@ do -- Move slot 2 dropdown (1-4): second triggerbot channel's move
     local dlCorner = Instance.new("UICorner"); dlCorner.CornerRadius = UDim.new(0, 6); dlCorner.Parent = dropList
 
     local function refreshSlotText()
-        dropBtn.Text = "Slot " .. tostring(triggerbot2Slot)
+        dropBtn.Text = "Slot " .. tostring(tbState.slot2)
     end
 
     for i = 1, 4 do
@@ -4843,7 +4896,7 @@ do -- Move slot 2 dropdown (1-4): second triggerbot channel's move
         opt.Parent = dropList
         local idx = i
         opt.MouseButton1Click:Connect(function()
-            triggerbot2Slot = idx
+            tbState.slot2 = idx
             refreshSlotText()
             dropList.Visible = false
             autoSaveSettings()
@@ -4863,7 +4916,7 @@ do -- Move slot 2 dropdown (1-4): second triggerbot channel's move
     settingsRefs.triggerbot2Slot = {
         Set = function(val)
             if type(val) == "number" and val >= 1 and val <= 4 then
-                triggerbot2Slot = math.floor(val)
+                tbState.slot2 = math.floor(val)
                 refreshSlotText()
             end
         end
@@ -4871,7 +4924,7 @@ do -- Move slot 2 dropdown (1-4): second triggerbot channel's move
 end
 
 makeMiscHeader("Infinity", 650)
-local autoInfinityToggleObj = createToggle(miscTabFrame, "AutoInfinity (JSON FILE)", 672, autoInfinityEnabled, function(state)
+local autoInfinityToggleObj = createToggle(tabFrames.misc, "AutoInfinity (JSON FILE)", 672, autoInfinityEnabled, function(state)
     autoInfinityEnabled = state
     if state then
         autoInfinityLoadDatabase()
@@ -4885,44 +4938,44 @@ local autoInfinityToggleObj = createToggle(miscTabFrame, "AutoInfinity (JSON FIL
 end)
 settingsRefs.autoInfinityEnabled = autoInfinityToggleObj
 
-settingsRefs.autoInfinityKey = createKeybind(miscTabFrame, "AutoInfinity Keybind", 708, autoInfinityKey, function(key)
+settingsRefs.autoInfinityKey = createKeybind(tabFrames.misc, "AutoInfinity Keybind", 708, autoInfinityKey, function(key)
     autoInfinityKey = key
 end)
 
-settingsRefs.autoInfinityLookSensitivity = createSlider(miscTabFrame, "Look sensitivity", 744, 0.1, 1.0, autoInfinityLookSensitivity, function(val)
-    autoInfinityLookSensitivity = val
+settingsRefs.autoInfinityLookSensitivity = createSlider(tabFrames.misc, "Look sensitivity", 744, 0.1, 1.0, aiState.lookSensitivity, function(val)
+    aiState.lookSensitivity = val
 end, function(text, val)
     local deg = math.deg(math.acos(math.clamp(val, 0, 1)))
     return text .. ": " .. string.format("%.2f", val) .. string.format(" (%.0f degrees)", deg)
 end)
 
-settingsRefs.autoInfinityRayRadius = createSlider(miscTabFrame, "Ray cast sensitivity", 792, 10, 100, autoInfinityRayRadius, function(val)
-    autoInfinityRayRadius = val
+settingsRefs.autoInfinityRayRadius = createSlider(tabFrames.misc, "Ray cast sensitivity", 792, 10, 100, aiState.rayRadius, function(val)
+    aiState.rayRadius = val
 end)
 
-settingsRefs.autoInfinityUnlocked = createToggle(miscTabFrame, "Autoinfinity unblock", 840, autoInfinityUnlocked, function(state)
+settingsRefs.autoInfinityUnlocked = createToggle(tabFrames.misc, "Autoinfinity unblock", 840, autoInfinityUnlocked, function(state)
     autoInfinityUnlocked = state
 end)
 
 makeMiscHeader("Utility", 878)
-settingsRefs.autoBlackFlashEnabled = createToggle(miscTabFrame, "Auto Black Flash", 900, autoBlackFlashEnabled, function(state)
+settingsRefs.autoBlackFlashEnabled = createToggle(tabFrames.misc, "Auto Black Flash", 900, autoBlackFlashEnabled, function(state)
     autoBlackFlashEnabled = state
 	applyBlackFlashHook()
 end)
 
-settingsRefs.autoSprintEnabled = createToggle(miscTabFrame, "Auto Sprint", 936, autoSprintEnabled, function(state)
-    autoSprintEnabled = state
-    if not state and sprintHeld then
-        sprintHeld = false
+settingsRefs.autoSprintEnabled = createToggle(tabFrames.misc, "Auto Sprint", 936, autoState.sprintEnabled, function(state)
+    autoState.sprintEnabled = state
+    if not state and autoState.sprintHeld then
+        autoState.sprintHeld = false
         VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.LeftShift, false, game)
     end
     autoSaveSettings()
 end)
-settingsRefs.autoPlayEnabled = createToggle(miscTabFrame, "Auto Play", 972, autoPlayEnabled, function(state)
+settingsRefs.autoPlayEnabled = createToggle(tabFrames.misc, "Auto Play", 972, autoPlayEnabled, function(state)
     autoPlayEnabled = state
 end)
 
-settingsRefs.toggleUIKey = createKeybind(miscTabFrame, "Close/Open UI", 1008, toggleUIKey, function(key)
+settingsRefs.toggleUIKey = createKeybind(tabFrames.misc, "Close/Open UI", 1008, toggleUIKey, function(key)
     toggleUIKey = key
 end)
 
@@ -4938,7 +4991,7 @@ configNameBox.TextColor3 = Color3.fromRGB(200, 200, 210)
 configNameBox.TextSize = 13
 configNameBox.Font = Enum.Font.GothamMedium
 configNameBox.ClearTextOnFocus = false
-configNameBox.Parent = configTabFrame
+configNameBox.Parent = tabFrames.config
 local configNameCorner = Instance.new("UICorner") configNameCorner.CornerRadius = UDim.new(0, 6) configNameCorner.Parent = configNameBox
 
 local saveBtn = Instance.new("TextButton")
@@ -4949,7 +5002,7 @@ saveBtn.Text = "Save"
 saveBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
 saveBtn.Font = Enum.Font.GothamBold
 saveBtn.TextSize = 13
-saveBtn.Parent = configTabFrame
+saveBtn.Parent = tabFrames.config
 local saveCorner = Instance.new("UICorner") saveCorner.CornerRadius = UDim.new(0, 6) saveCorner.Parent = saveBtn
 
 saveBtn.MouseButton1Click:Connect(function()
@@ -4965,7 +5018,7 @@ local configListFrame = Instance.new("Frame")
 configListFrame.Size = UDim2.new(1, 0, 1, -50)
 configListFrame.Position = UDim2.new(0, 0, 0, configY + 38)
 configListFrame.BackgroundTransparency = 1
-configListFrame.Parent = configTabFrame
+configListFrame.Parent = tabFrames.config
 
 local configListLayout = Instance.new("UIListLayout")
 configListLayout.FillDirection = Enum.FillDirection.Vertical
@@ -5050,7 +5103,7 @@ refreshConfigList()
 
 -- ====================== TARGET BAN ======================
 -- Clean up old target ban UI elements from previous deployments
-local oldTB = miscTabFrame:FindFirstChild("TargetBanContainer")
+local oldTB = tabFrames.misc:FindFirstChild("TargetBanContainer")
 if oldTB then oldTB:Destroy() end
 
 local tbContainer = Instance.new("Frame")
@@ -5059,7 +5112,7 @@ tbContainer.Size = UDim2.new(1, 0, 0, 186)
 tbContainer.Position = UDim2.new(0, 0, 0, 1046)
 tbContainer.BackgroundTransparency = 1
 tbContainer.ClipsDescendants = false
-tbContainer.Parent = miscTabFrame
+tbContainer.Parent = tabFrames.misc
 
 local targetBanLabel = Instance.new("TextLabel")
 targetBanLabel.Size = UDim2.new(1, 0, 0, 18)
@@ -5236,22 +5289,22 @@ local function unbanChar(name)
 	return ok
 end
 
-local targetBanToggleRef = createToggle(tbContainer, "Auto Ban Target", 150, targetBanEnabled, function(state)
-	local wasEnabled = targetBanEnabled
-	targetBanEnabled = state
+local targetBanToggleRef = createToggle(tbContainer, "Auto Ban Target", 150, banState.targetEnabled, function(state)
+	local wasEnabled = banState.targetEnabled
+	banState.targetEnabled = state
 	if state then
-		targetBanCharacters = {}
-		if targetBanBoxRefs[1].Text ~= "" then targetBanCharacters[#targetBanCharacters+1] = targetBanBoxRefs[1].Text end
-		if targetBanBoxRefs[2].Text ~= "" then targetBanCharacters[#targetBanCharacters+1] = targetBanBoxRefs[2].Text end
-		if targetBanBoxRefs[3].Text ~= "" then targetBanCharacters[#targetBanCharacters+1] = targetBanBoxRefs[3].Text end
-		if targetBanBoxRefs[4].Text ~= "" then targetBanCharacters[#targetBanCharacters+1] = targetBanBoxRefs[4].Text end
-		targetBanCharIdx = 1
-		lastBannedChars = {}
-		banActioned = false
+		banState.targets = {}
+		if targetBanBoxRefs[1].Text ~= "" then banState.targets[#banState.targets+1] = targetBanBoxRefs[1].Text end
+		if targetBanBoxRefs[2].Text ~= "" then banState.targets[#banState.targets+1] = targetBanBoxRefs[2].Text end
+		if targetBanBoxRefs[3].Text ~= "" then banState.targets[#banState.targets+1] = targetBanBoxRefs[3].Text end
+		if targetBanBoxRefs[4].Text ~= "" then banState.targets[#banState.targets+1] = targetBanBoxRefs[4].Text end
+		banState.targetIdx = 1
+		banState.lastBanned = {}
+		banState.targetActioned = false
 		banCooldown = 0
 	end
-	if wasEnabled and not state and #lastBannedChars > 0 then
-		for _, name in lastBannedChars do
+	if wasEnabled and not state and #banState.lastBanned > 0 then
+		for _, name in banState.lastBanned do
 			unbanChar(name)
 			task.wait(0.15)
 		end
@@ -5273,18 +5326,18 @@ antiBanLabel.Visible = false
 
 antiBanBoxRef[1] = makeTBBox(208, "Character to anti-ban")
 antiBanBoxRef[1].Visible = false
-local antiBanToggleRef = createToggle(tbContainer, "Anti Ban", 240, antiBanEnabled, function(state)
-	local wasEnabled = antiBanEnabled
-	antiBanEnabled = state
+local antiBanToggleRef = createToggle(tbContainer, "Anti Ban", 240, banState.antiEnabled, function(state)
+	local wasEnabled = banState.antiEnabled
+	banState.antiEnabled = state
 	if state then
-		antiBanCharacters = {}
-		if antiBanBoxRef[1].Text ~= "" then antiBanCharacters[#antiBanCharacters+1] = antiBanBoxRef[1].Text end
-		antiBanCharIdx = 1
-		antiBanPhase = "ban"
-		antiBanActioned = false
-		antiBanCooldown = 0
-		antiBanPageIdx = 0
-		antiBanPages = {}
+		banState.antiChars = {}
+		if antiBanBoxRef[1].Text ~= "" then banState.antiChars[#banState.antiChars+1] = antiBanBoxRef[1].Text end
+		banState.antiIdx = 1
+		banState.antiPhase = "ban"
+		banState.antiActioned = false
+		banState.antiCooldown = 0
+		banState.antiPageIdx = 0
+		banState.antiPages = {}
 	end
 	autoSaveSettings()
 end)
@@ -5307,42 +5360,42 @@ local function getPageFrames(chars)
 end
 
 table.insert(connections, RunService.RenderStepped:Connect(function()
-	if not targetBanEnabled and not antiBanEnabled then return end
+	if not banState.targetEnabled and not banState.antiEnabled then return end
 	local bcAvail = PlayerGui:FindFirstChild("BanChooser")
 	bcAvail = bcAvail and bcAvail.Enabled
 	if bcAvail and not lastBanChooserAvail then
-		if targetBanEnabled and #targetBanCharacters > 0 and banActioned then
-			banActioned = false; targetBanCharIdx = 1; lastBannedChars = {}
+		if banState.targetEnabled and #banState.targets > 0 and banState.targetActioned then
+			banState.targetActioned = false; banState.targetIdx = 1; banState.lastBanned = {}
 			searchPagesList = {}; searchPageIdx = 0; banCooldown = 0
 		end
-		if antiBanEnabled and #antiBanCharacters > 0 and antiBanActioned then
-			antiBanActioned = false; antiBanCharIdx = 1; antiBanPhase = "ban"
-			antiBanPages = {}; antiBanPageIdx = 0; antiBanCooldown = 0
+		if banState.antiEnabled and #banState.antiChars > 0 and banState.antiActioned then
+			banState.antiActioned = false; banState.antiIdx = 1; banState.antiPhase = "ban"
+			banState.antiPages = {}; banState.antiPageIdx = 0; banState.antiCooldown = 0
 		end
 	end
 	lastBanChooserAvail = bcAvail
 
 	local ok, err = pcall(function()
-		if not targetBanEnabled then return end
-		if #targetBanCharacters == 0 then return end
-		if banActioned then return end
+		if not banState.targetEnabled then return end
+		if #banState.targets == 0 then return end
+		if banState.targetActioned then return end
 		if banCooldown > 0 then banCooldown = banCooldown - 1 return end
 
-		while targetBanCharIdx <= #targetBanCharacters do
-			local n = targetBanCharacters[targetBanCharIdx]:lower()
+		while banState.targetIdx <= #banState.targets do
+			local n = banState.targets[banState.targetIdx]:lower()
 			local skip = false
-			for _, b in lastBannedChars do
+			for _, b in banState.lastBanned do
 				if b:lower() == n then skip = true break end
 			end
 			if not skip then break end
-			targetBanCharIdx = targetBanCharIdx + 1
+			banState.targetIdx = banState.targetIdx + 1
 		end
-		if targetBanCharIdx > #targetBanCharacters then
-			banActioned = true
+		if banState.targetIdx > #banState.targets then
+			banState.targetActioned = true
 			return
 		end
 
-		local searchName = targetBanCharacters[targetBanCharIdx]:lower()
+		local searchName = banState.targets[banState.targetIdx]:lower()
 		local bc = PlayerGui:FindFirstChild("BanChooser")
 		if not bc or not bc.Enabled then return end
 		local cs = bc:FindFirstChild("CharacterSelect")
@@ -5377,8 +5430,8 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 
 		if btn then
 			if clickBanButton(btn) then
-				table.insert(lastBannedChars, btn.Name)
-				targetBanCharIdx = targetBanCharIdx + 1
+				table.insert(banState.lastBanned, btn.Name)
+				banState.targetIdx = banState.targetIdx + 1
 				searchPageIdx = 0
 				searchPagesList = {}
 				banCooldown = 30
@@ -5388,7 +5441,7 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 		end
 
 		if searchPageIdx > #searchPagesList then
-			targetBanCharIdx = targetBanCharIdx + 1
+			banState.targetIdx = banState.targetIdx + 1
 			searchPageIdx = 0
 			searchPagesList = {}
 			do end
@@ -5405,13 +5458,13 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 	end
 
 	local ok2, err2 = pcall(function()
-		if not antiBanEnabled then return end
-		if antiBanActioned then return end
-		if targetBanEnabled and not banActioned then return end
-		if #antiBanCharacters == 0 then return end
-		if antiBanCooldown > 0 then antiBanCooldown = antiBanCooldown - 1 return end
+		if not banState.antiEnabled then return end
+		if banState.antiActioned then return end
+		if banState.targetEnabled and not banState.targetActioned then return end
+		if #banState.antiChars == 0 then return end
+		if banState.antiCooldown > 0 then banState.antiCooldown = banState.antiCooldown - 1 return end
 
-		local searchName = antiBanCharacters[1]:lower()
+		local searchName = banState.antiChars[1]:lower()
 		local bc = PlayerGui:FindFirstChild("BanChooser")
 		if not bc or not bc.Enabled then return end
 		local cs = bc:FindFirstChild("CharacterSelect")
@@ -5419,13 +5472,13 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 		local chars = cs:FindFirstChild("Characters")
 		if not chars then return end
 
-		if #antiBanPages == 0 then
-			antiBanPages = getPageFrames(chars)
+		if #banState.antiPages == 0 then
+			banState.antiPages = getPageFrames(chars)
 		end
-		if #antiBanPages == 0 then return end
+		if #banState.antiPages == 0 then return end
 
 		local btn
-		for _, p in antiBanPages do
+		for _, p in banState.antiPages do
 			if not p.Visible then continue end
 			for _, cat in p:GetChildren() do
 				if not cat:IsA("Frame") then continue end
@@ -5446,28 +5499,28 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 
 		if btn then
 			if clickBanButton(btn) then
-				if antiBanPhase == "ban" then
-					antiBanPhase = "unban"
-					antiBanCooldown = 30
-					antiBanPageIdx = 0
-					antiBanPages = {}
+				if banState.antiPhase == "ban" then
+					banState.antiPhase = "unban"
+					banState.antiCooldown = 30
+					banState.antiPageIdx = 0
+					banState.antiPages = {}
 					do end
 				else
-					antiBanActioned = true
-					antiBanPhase = "ban"
-					antiBanPageIdx = 0
-					antiBanPages = {}
+					banState.antiActioned = true
+					banState.antiPhase = "ban"
+					banState.antiPageIdx = 0
+					banState.antiPages = {}
 					do end
 				end
 			end
-		elseif antiBanPageIdx >= #antiBanPages then do end
-			antiBanActioned = true
-			antiBanPageIdx = 0
-			antiBanPages = {}
+		elseif banState.antiPageIdx >= #banState.antiPages then do end
+			banState.antiActioned = true
+			banState.antiPageIdx = 0
+			banState.antiPages = {}
 		else
-			antiBanPageIdx = antiBanPageIdx + 1
-			for i, p in ipairs(antiBanPages) do
-				p.Visible = (i == antiBanPageIdx)
+			banState.antiPageIdx = banState.antiPageIdx + 1
+			for i, p in ipairs(banState.antiPages) do
+				p.Visible = (i == banState.antiPageIdx)
 			end
 		end
 	end)
@@ -5484,7 +5537,7 @@ snatchBtn.Text = "PS Code Snatch"
 snatchBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
 snatchBtn.Font = Enum.Font.GothamBold
 snatchBtn.TextSize = 13
-snatchBtn.Parent = miscTabFrame
+snatchBtn.Parent = tabFrames.misc
 local snatchCorner = Instance.new("UICorner") snatchCorner.CornerRadius = UDim.new(0, 6) snatchCorner.Parent = snatchBtn
 
 -- Test Hold Block button (holds F indefinitely until repressed; for triggerbot testing)
@@ -5496,7 +5549,7 @@ testHoldBtn.Text = "Hold Block (Test)"
 testHoldBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
 testHoldBtn.Font = Enum.Font.GothamBold
 testHoldBtn.TextSize = 13
-testHoldBtn.Parent = miscTabFrame
+testHoldBtn.Parent = tabFrames.misc
 local testHoldCorner = Instance.new("UICorner") testHoldCorner.CornerRadius = UDim.new(0, 6) testHoldCorner.Parent = testHoldBtn
 
 testHoldBtn.MouseButton1Click:Connect(function()
@@ -5682,7 +5735,7 @@ nanamiBtn.Text = "Auto Nanami"
 nanamiBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
 nanamiBtn.Font = Enum.Font.GothamBold
 nanamiBtn.TextSize = 13
-nanamiBtn.Parent = miscTabFrame
+nanamiBtn.Parent = tabFrames.misc
 local nanamiBtnCorner = Instance.new("UICorner") nanamiBtnCorner.CornerRadius = UDim.new(0, 6) nanamiBtnCorner.Parent = nanamiBtn
 
 nanamiBtn.MouseButton1Click:Connect(function()
@@ -5698,7 +5751,7 @@ unloadBtn.Text = "Unload UI"
 unloadBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
 unloadBtn.Font = Enum.Font.GothamBold
 unloadBtn.TextSize = 13
-unloadBtn.Parent = miscTabFrame
+unloadBtn.Parent = tabFrames.misc
 local unloadCorner = Instance.new("UICorner") unloadCorner.CornerRadius = UDim.new(0, 6) unloadCorner.Parent = unloadBtn
 unloadBtn.MouseButton1Click:Connect(function()
 	if unloadScript then unloadScript() end
@@ -5713,61 +5766,61 @@ creditsLabel.TextColor3 = Color3.fromRGB(120, 120, 120)
 creditsLabel.TextSize = 14
 creditsLabel.Font = Enum.Font.Gotham
 creditsLabel.TextXAlignment = Enum.TextXAlignment.Center
-creditsLabel.Parent = miscTabFrame
+creditsLabel.Parent = tabFrames.misc
 
 -- Tab Switcher Logic
 local function setTab(tabName)
-	mainTabFrame.Visible = (tabName == "Lock")
-	espTabFrame.Visible = (tabName == "ESP")
-	miscTabFrame.Visible = (tabName == "Misc")
- 	rageTabFrame.Visible = (tabName == "Rage")
- 	charactersTabFrame.Visible = (tabName == "Characters")
- 	configTabFrame.Visible = (tabName == "Config")
-	skinTabFrame.Visible = (tabName == "Skin")
+	tabFrames.main.Visible = (tabName == "Lock")
+	tabFrames.esp.Visible = (tabName == "ESP")
+	tabFrames.misc.Visible = (tabName == "Misc")
+ 	tabFrames.rage.Visible = (tabName == "Rage")
+ 	tabFrames.chars.Visible = (tabName == "Characters")
+ 	tabFrames.config.Visible = (tabName == "Config")
+	tabFrames.skin.Visible = (tabName == "Skin")
 	
-	TweenService:Create(mainTabBtn, TweenInfo.new(0.18), {
+	TweenService:Create(tabButtons.main, TweenInfo.new(0.18), {
 		BackgroundColor3 = (tabName == "Lock") and Color3.fromRGB(255, 105, 180) or Color3.fromRGB(35, 35, 45),
 		TextColor3 = (tabName == "Lock") and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(150, 150, 170)
 	}):Play()
 	
-	TweenService:Create(espTabBtn, TweenInfo.new(0.18), {
+	TweenService:Create(tabButtons.esp, TweenInfo.new(0.18), {
 		BackgroundColor3 = (tabName == "ESP") and Color3.fromRGB(255, 105, 180) or Color3.fromRGB(35, 35, 45),
 		TextColor3 = (tabName == "ESP") and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(150, 150, 170)
 	}):Play()
 	
-	TweenService:Create(miscTabBtn, TweenInfo.new(0.18), {
+	TweenService:Create(tabButtons.misc, TweenInfo.new(0.18), {
 		BackgroundColor3 = (tabName == "Misc") and Color3.fromRGB(255, 105, 180) or Color3.fromRGB(35, 35, 45),
 		TextColor3 = (tabName == "Misc") and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(150, 150, 170)
 	}):Play()
 	
- 	TweenService:Create(rageTabBtn, TweenInfo.new(0.18), {
+ 	TweenService:Create(tabButtons.rage, TweenInfo.new(0.18), {
  		BackgroundColor3 = (tabName == "Rage") and Color3.fromRGB(255, 105, 180) or Color3.fromRGB(35, 35, 45),
  		TextColor3 = (tabName == "Rage") and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(150, 150, 170)
  	}):Play()
  	
- 	TweenService:Create(charactersTabBtn, TweenInfo.new(0.18), {
+ 	TweenService:Create(tabButtons.chars, TweenInfo.new(0.18), {
  		BackgroundColor3 = (tabName == "Characters") and Color3.fromRGB(255, 105, 180) or Color3.fromRGB(35, 35, 45),
  		TextColor3 = (tabName == "Characters") and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(150, 150, 170)
  	}):Play()
  	
- 	TweenService:Create(configTabBtn, TweenInfo.new(0.18), {
+ 	TweenService:Create(tabButtons.config, TweenInfo.new(0.18), {
 		BackgroundColor3 = (tabName == "Config") and Color3.fromRGB(255, 105, 180) or Color3.fromRGB(35, 35, 45),
 		TextColor3 = (tabName == "Config") and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(150, 150, 170)
 	}):Play()
 	
-	TweenService:Create(skinTabBtn, TweenInfo.new(0.18), {
+	TweenService:Create(tabButtons.skin, TweenInfo.new(0.18), {
 		BackgroundColor3 = (tabName == "Skin") and Color3.fromRGB(255, 105, 180) or Color3.fromRGB(35, 35, 45),
 		TextColor3 = (tabName == "Skin") and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(150, 150, 170)
 	}):Play()
 end
 
-mainTabBtn.MouseButton1Click:Connect(function() setTab("Lock") end)
-espTabBtn.MouseButton1Click:Connect(function() setTab("ESP") end)
-miscTabBtn.MouseButton1Click:Connect(function() setTab("Misc") end)
-rageTabBtn.MouseButton1Click:Connect(function() setTab("Rage") end)
-charactersTabBtn.MouseButton1Click:Connect(function() setTab("Characters") end)
-configTabBtn.MouseButton1Click:Connect(function() setTab("Config") end)
-skinTabBtn.MouseButton1Click:Connect(function() setTab("Skin") end)
+tabButtons.main.MouseButton1Click:Connect(function() setTab("Lock") end)
+tabButtons.esp.MouseButton1Click:Connect(function() setTab("ESP") end)
+tabButtons.misc.MouseButton1Click:Connect(function() setTab("Misc") end)
+tabButtons.rage.MouseButton1Click:Connect(function() setTab("Rage") end)
+tabButtons.chars.MouseButton1Click:Connect(function() setTab("Characters") end)
+tabButtons.config.MouseButton1Click:Connect(function() setTab("Config") end)
+tabButtons.skin.MouseButton1Click:Connect(function() setTab("Skin") end)
 
 -- ====================== FUNCTIONS ======================
 local function isTeammate(player)
@@ -5833,46 +5886,46 @@ unloadScript = function()
 	ultEspEnabled = false
 	autoBlockEnabled = false
 	autoCounterEnabled = false
-	moveEspEnabled = false
-	moveInputsEnabled = false
+	espState.moveEnabled = false
+	espState.inputsEnabled = false
 	autoBlackFlashEnabled = false
 	autoPlayEnabled = false
-	autoSprintEnabled = false
-	triggerbotEnabled = false
+	autoState.sprintEnabled = false
+	tbState.enabled = false
 	flyEnabled = false
 	cleanupFlyMovers()
-	headAttachEnabled = false
-	hpChainEnabled = false
-	sgChainEnabled = false
-	headAttachHolding = false
-	headAttachFlying = false
-	headAttachCurrent = nil
+	hattState.enabled = false
+	chainState.hpEnabled = false
+	chainState.sgEnabled = false
+	hattState.holding = false
+	hattState.flying = false
+	hattState.current = nil
 	pcall(function()
 		local c = LocalPlayer.Character
 		local h = c and c:FindFirstChildOfClass("Humanoid")
 		if h then h.PlatformStand = false end
 	end)
-	triggerbot1Pending = false
-	triggerbot2Pending = false
-	triggerbotMarkPlayer = nil
-	triggerbotMarkChar = nil
-	triggerbotWasBlocking = false
-	triggerbotAwaitingCd = false
-	triggerbot2AwaitingCd = false
-	targetBanCharacters = {}
-	targetBanCharIdx = 1
-	targetBanEnabled = false
-	banActioned = false
-	lastBannedChars = {}
+	tbState.pending1 = false
+	tbState.pending2 = false
+	tbState.markPlayer = nil
+	tbState.markChar = nil
+	tbState.wasBlocking = false
+	tbState.awaitingCd = false
+	tbState.awaitingCd2 = false
+	banState.targets = {}
+	banState.targetIdx = 1
+	banState.targetEnabled = false
+	banState.targetActioned = false
+	banState.lastBanned = {}
 	banCooldown = 0
-	antiBanCharacters = {}
-	antiBanCharIdx = 1
-	antiBanEnabled = false
-	antiBanActioned = false
-	antiBanPhase = "ban"
-	antiBanCooldown = 0
-	antiBanPageIdx = 0
-	antiBanPages = {}
+	banState.antiChars = {}
+	banState.antiIdx = 1
+	banState.antiEnabled = false
+	banState.antiActioned = false
+	banState.antiPhase = "ban"
+	banState.antiCooldown = 0
+	banState.antiPageIdx = 0
+	banState.antiPages = {}
 	if banThread then task.cancel(banThread) banThread = nil end
 	
 	if blackFlashCheck and originalBlackFlashHandler then
@@ -5889,8 +5942,8 @@ unloadScript = function()
 		testHoldBlock = false
 		VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
 	end
-	if sprintHeld then
-		sprintHeld = false
+	if autoState.sprintHeld then
+		autoState.sprintHeld = false
 		VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.LeftShift, false, game)
 	end
 	
@@ -6053,13 +6106,13 @@ local function createChargeBillboard(player, character)
 	local Label
 	if Billboard then
 		Label = Billboard:FindFirstChild("ChargeText")
-		Billboard.Size = UDim2.new(ultEspSize, 0, ultEspSize / 3, 0)
-		Billboard.StudsOffset = Vector3.new(-(ultEspSize * 0.25 + 2.65), 0, ultEspSize / 6)
+		Billboard.Size = UDim2.new(espState.ultSize, 0, espState.ultSize / 3, 0)
+		Billboard.StudsOffset = Vector3.new(-(espState.ultSize * 0.25 + 2.65), 0, espState.ultSize / 6)
 	else
 		Billboard = Instance.new("BillboardGui")
 		Billboard.Name = player.Name .. "_ChargeBillboard"
-		Billboard.Size = UDim2.new(ultEspSize, 0, ultEspSize / 3, 0)
-		Billboard.StudsOffset = Vector3.new(-(ultEspSize * 0.25 + 2.65), 0, ultEspSize / 6)
+		Billboard.Size = UDim2.new(espState.ultSize, 0, espState.ultSize / 3, 0)
+		Billboard.StudsOffset = Vector3.new(-(espState.ultSize * 0.25 + 2.65), 0, espState.ultSize / 6)
 		Billboard.AlwaysOnTop = true
 		
 		Label = Instance.new("TextLabel")
@@ -6086,7 +6139,7 @@ local function createChargeBillboard(player, character)
 	end
 	
 	Billboard.Adornee = head
-	chargeBillboards[player] = Label
+	cdState.charge[player] = Label
 end
 
 -- Per-player cached full move ordering. Stable within a single life to avoid
@@ -6108,42 +6161,42 @@ local function getPlayerCooldowns(player)
 			local cdNum = cdVal and tonumber(cdVal)
 			
 			local key = player.Name .. "_" .. config.Name
-			local lastCd = lastCdNums[key]
+			local lastCd = cdState.lastNums[key]
 			local remaining = 0
 			
 			if cdNum then
 				-- Track maximum value in current cycle to filter attribute jitter
-				local maxSeen = maxCooldowns[key]
+				local maxSeen = cdState.max[key]
 				if not maxSeen then
-					maxCooldowns[key] = cdNum
+					cdState.max[key] = cdNum
 				elseif cdNum > maxSeen then
-					maxCooldowns[key] = cdNum
+					cdState.max[key] = cdNum
 				elseif maxSeen - cdNum > 5 then
-					maxCooldowns[key] = cdNum
+					cdState.max[key] = cdNum
 				else
 					cdNum = maxSeen
 				end
 				
 				-- Rate calibration & smooth interpolation between attribute updates
 				local now = os.clock()
-				local changeTime = cdChangeTimes[key]
-				local changeValue = cdChangeValues[key]
+				local changeTime = cdState.changeTimes[key]
+				local changeValue = cdState.changeValues[key]
 				
 				if changeValue ~= cdNum then
 					if changeTime and changeValue and cdNum > changeValue then
 						local dt = now - changeTime
 						local dv = cdNum - changeValue
 						if dt > 0.05 and dv > 0 then
-							cdRates[key] = dv / dt
+							cdState.rates[key] = dv / dt
 						end
 					end
-					cdChangeTimes[key] = now
-					cdChangeValues[key] = cdNum
+					cdState.changeTimes[key] = now
+					cdState.changeValues[key] = cdNum
 				end
 				
-				local rate = cdRates[key]
-				if rate and rate > 0.001 and cdChangeTimes[key] then
-					local elapsed = now - cdChangeTimes[key]
+				local rate = cdState.rates[key]
+				if rate and rate > 0.001 and cdState.changeTimes[key] then
+					local elapsed = now - cdState.changeTimes[key]
 					local estimatedCd = math.min(20, cdNum + elapsed * rate)
 					remaining = (20 - estimatedCd) / rate
 				else
@@ -6152,14 +6205,14 @@ local function getPlayerCooldowns(player)
 				if remaining < 0 then remaining = 0 end
 			else
 				-- Cooldown completed
-				maxCooldowns[key] = nil
-				cdChangeTimes[key] = nil
-				cdChangeValues[key] = nil
-				cdRates[key] = nil
+				cdState.max[key] = nil
+				cdState.changeTimes[key] = nil
+				cdState.changeValues[key] = nil
+				cdState.rates[key] = nil
 				remaining = 0
 			end
 			
-			lastCdNums[key] = cdNum
+			cdState.lastNums[key] = cdNum
 			
 			if remaining > 0.5 then
 				table.insert(cds, { Name = config.Name, Remaining = remaining, IsReady = false, Config = config, Index = index })
@@ -6247,28 +6300,28 @@ end
 local function onPlayerRemoving(player)
 	local billboard = parentGui:FindFirstChild(player.Name .. "_ChargeBillboard")
 	if billboard then billboard:Destroy() end
-	chargeBillboards[player] = nil
+	cdState.charge[player] = nil
 	
 	local mBillboard = parentGui:FindFirstChild(player.Name .. "_MoveBillboard")
 	if mBillboard then mBillboard:Destroy() end
-	moveBillboards[player] = nil
+	cdState.move[player] = nil
 	
-	for k in pairs(moveFlashTimes) do
+	for k in pairs(cdState.flashTimes) do
 		if k:find(player.Name .. "_") then
-			moveFlashTimes[k] = nil
+			cdState.flashTimes[k] = nil
 		end
 	end
-	local conns = moveInputConns[player]
+	local conns = cdState.inputConns[player]
 	if conns then
 		for _, conn in ipairs(conns) do
 			conn:Disconnect()
 		end
-		moveInputConns[player] = nil
+		cdState.inputConns[player] = nil
 	end
 	moveOrderCache[player.Name] = nil
 	moveOrderChar[player.Name] = nil
 	local pn = player.Name .. "_"
-	for _, tbl in ipairs({maxCooldowns, lastCdNums, cdChangeTimes, cdChangeValues, cdRates}) do
+	for _, tbl in ipairs({cdState.max, cdState.lastNums, cdState.changeTimes, cdState.changeValues, cdState.rates}) do
 		for k in pairs(tbl) do
 			if k:sub(1, #pn) == pn then tbl[k] = nil end
 		end
@@ -6277,7 +6330,7 @@ local function onPlayerRemoving(player)
 end
 
 local function setupCooldownListeners(player)
-	if moveInputConns[player] then return end
+	if cdState.inputConns[player] then return end
 	local backpack = player:FindFirstChild("Backpack")
 	if not backpack then return end
 	local conns = {}
@@ -6305,12 +6358,12 @@ local function setupCooldownListeners(player)
 		end
 	end)
 	table.insert(conns, childConn)
-	moveInputConns[player] = conns
+	cdState.inputConns[player] = conns
 end
 
 local function createMoveBillboard(player, character)
 	if player == LocalPlayer then return end
-	if not moveEspEnabled and not moveInputsEnabled then return end
+	if not espState.moveEnabled and not espState.inputsEnabled then return end
 	if not character then return end
 	local head = getCharacterHeadYielding(character)
 	if not head then return end
@@ -6322,7 +6375,7 @@ local function createMoveBillboard(player, character)
 	else
 		Billboard = Instance.new("BillboardGui")
 		Billboard.Name = player.Name .. "_MoveBillboard"
-		Billboard.Size = UDim2.new(moveEspSize, 0, 7.2, 0)
+		Billboard.Size = UDim2.new(espState.moveSize, 0, 7.2, 0)
 		Billboard.StudsOffset = Vector3.new(3.4, 0, 0)
 		Billboard.AlwaysOnTop = true
 		
@@ -6345,14 +6398,14 @@ local function createMoveBillboard(player, character)
 		Billboard.Adornee = head
 	end
 	if Container then
-		moveBillboards[player] = Container
+		cdState.move[player] = Container
 	end
 	setupCooldownListeners(player)
 end
 
 -- ====================== IMPROVED ARROW SYSTEM ======================
 local function getArrow()
-	for _, arrow in ipairs(arrowPool) do
+	for _, arrow in ipairs(cdState.arrowPool) do
 		if not arrow.Used then
 			arrow.Used = true
 			arrow.Frame.Visible = true
@@ -6387,12 +6440,12 @@ distanceLabel.TextScaled = true
 	distanceLabel.Parent = frame
 
 	local arrow = {Frame = frame, Label = arrowLabel, DistanceLabel = distanceLabel, Used = true}
-	table.insert(arrowPool, arrow)
+	table.insert(cdState.arrowPool, arrow)
 	return arrow
 end
 
 local function updateArrows()
-	for _, arrow in ipairs(arrowPool) do
+	for _, arrow in ipairs(cdState.arrowPool) do
 		arrow.Used = false
 		arrow.Frame.Visible = false
 	end
@@ -7438,18 +7491,18 @@ table.insert(connections, UserInputService.InputBegan:Connect(function(input, gp
 	-- Disabled master toggle means keybinds are ignored entirely.
 	-- Re-pressing the same key while its request is still pending cancels it
 	-- early (unmarks if no other request remains) instead of retargeting.
-	if input.KeyCode == triggerbotKey and triggerbotEnabled then
-		if triggerbot1Pending then
-			clearTriggerRequest(1, "Triggerbot cancelled (slot " .. tostring(triggerbotSlot) .. ")")
+	if input.KeyCode == tbState.key and tbState.enabled then
+		if tbState.pending1 then
+			tbState.clearRequest(1, "Triggerbot cancelled (slot " .. tostring(tbState.slot) .. ")")
 		else
-			triggerbot1Pending = true
-			triggerbot1RequestTime = os.clock()
-			triggerbotRetarget = true -- re-mark whoever is under the crosshair now
+			tbState.pending1 = true
+			tbState.req1 = os.clock()
+			tbState.retarget = true -- re-mark whoever is under the crosshair now
 			autoSaveSettings()
 			pcall(function()
 				game:GetService("StarterGui"):SetCore("SendNotification", {
 					Title = "Triggerbot",
-					Text = "Firing move slot " .. tostring(triggerbotSlot) .. " when clean",
+					Text = "Firing move slot " .. tostring(tbState.slot) .. " when clean",
 					Duration = 1.5
 				})
 			end)
@@ -7460,18 +7513,18 @@ table.insert(connections, UserInputService.InputBegan:Connect(function(input, gp
 	-- Disabled master toggle means keybinds are ignored entirely.
 	-- Re-pressing the same key while its request is still pending cancels it
 	-- early (unmarks if no other request remains) instead of retargeting.
-	if input.KeyCode == triggerbot2Key and triggerbotEnabled then
-		if triggerbot2Pending then
-			clearTriggerRequest(2, "Triggerbot cancelled (slot " .. tostring(triggerbot2Slot) .. ")")
+	if input.KeyCode == tbState.key2 and tbState.enabled then
+		if tbState.pending2 then
+			tbState.clearRequest(2, "Triggerbot cancelled (slot " .. tostring(tbState.slot2) .. ")")
 		else
-			triggerbot2Pending = true
-			triggerbot2RequestTime = os.clock()
-			triggerbotRetarget = true -- re-mark whoever is under the crosshair now
+			tbState.pending2 = true
+			tbState.req2 = os.clock()
+			tbState.retarget = true -- re-mark whoever is under the crosshair now
 			autoSaveSettings()
 			pcall(function()
 				game:GetService("StarterGui"):SetCore("SendNotification", {
 					Title = "Triggerbot",
-					Text = "Firing move slot " .. tostring(triggerbot2Slot) .. " when clean",
+					Text = "Firing move slot " .. tostring(tbState.slot2) .. " when clean",
 					Duration = 1.5
 				})
 			end)
@@ -7675,7 +7728,7 @@ end))
 
 -- Real-time update loop for Ult ESP (Displays only [Value%], works independently of Enable toggle)
 table.insert(connections, RunService.RenderStepped:Connect(function()
-	for player, label in pairs(chargeBillboards) do
+	for player, label in pairs(cdState.charge) do
 		local success, err = pcall(function()
 			if player and player.Parent and label and label.Parent then
 				local char = player.Character
@@ -7696,7 +7749,7 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 			else
 				local billboard = parentGui:FindFirstChild(player.Name .. "_ChargeBillboard")
 				if billboard then billboard:Destroy() end
-				chargeBillboards[player] = nil
+				cdState.charge[player] = nil
 			end
 		end)
 		if not success then do end
@@ -7709,12 +7762,12 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 	local now = os.clock()
 	local heavyDue = now - lastMoveEspUpdate >= 0.1
 	if heavyDue then lastMoveEspUpdate = now end
-	for player, container in pairs(moveBillboards) do
+	for player, container in pairs(cdState.move) do
 		local success, err = pcall(function()
 			if player and player.Parent and container and container.Parent then
 				local char = player.Character
 				local head = char and getCharacterHeadNonYielding(char)
-				if head and (moveEspEnabled or moveInputsEnabled) then
+				if head and (espState.moveEnabled or espState.inputsEnabled) then
 					if container.Parent.Adornee ~= head then
 						container.Parent.Adornee = head
 					end
@@ -7723,7 +7776,7 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 					container.Parent.Enabled = false
 				end
 				
-				if heavyDue and head and (moveEspEnabled or moveInputsEnabled) then
+				if heavyDue and head and (espState.moveEnabled or espState.inputsEnabled) then
 					local cds = getPlayerCooldowns(player)
 					
 					-- 1. Gather names of moves currently on cooldown
@@ -7832,7 +7885,7 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 							local cdLabel = box:FindFirstChild("CooldownText")
 							local cdOverlay = box:FindFirstChild("CooldownOverlay")
 							local flashKey = player.Name .. "_" .. cd.Name
-							local flashTime = moveFlashTimes[flashKey]
+							local flashTime = cdState.flashTimes[flashKey]
 							local isFlashing = flashTime and (now - flashTime) < 0.15
 							
 							if numLabel then numLabel.Text = tostring(idx) end
@@ -7886,7 +7939,7 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 				if not player or not player.Parent then
 					local billboard = parentGui:FindFirstChild(player.Name .. "_MoveBillboard")
 					if billboard then billboard:Destroy() end
-					moveBillboards[player] = nil
+					cdState.move[player] = nil
 				end
 			end
 		end)
@@ -8111,7 +8164,7 @@ end
 table.insert(connections, RunService.RenderStepped:Connect(function()
 	if not autoPlayEnabled then return end
 	local now = os.clock()
-	if now - lastSkillUseTime < skillUseInterval then return end
+	if now - autoState.lastSkillUseTime < autoState.skillUseInterval then return end
 
 	local char = LocalPlayer.Character
 	if not char then return end
@@ -8122,14 +8175,14 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 	if not movesContainer then return end
 
 	for offset = 1, 4 do
-		local i = (lastUsedSlot + offset - 1) % 4 + 1
+		local i = (autoState.lastUsedSlot + offset - 1) % 4 + 1
 		local slotObj = movesContainer:FindFirstChild(tostring(i))
 		if slotObj then
 			local cd = slotObj:FindFirstChild("CD")
 			if cd and cd.Visible and cd.Size.Y.Scale >= 0 then
-				lastUsedSlot = i
-				lastSkillUseTime = now
-				skillFiredTime = now
+				autoState.lastUsedSlot = i
+				autoState.lastSkillUseTime = now
+				autoState.skillFiredTime = now
 				fireSkillKey(i)
 				break
 			end
@@ -8250,20 +8303,20 @@ end
 -- each keypress is one firing attempt, confirmed by the slot's cooldown. When
 -- no requests remain the shared lock (and arrow) drops with them, so nothing
 -- lingers while the toggle just sits on.
-clearTriggerRequest = function(idx, msg, silent)
+tbState.clearRequest = function(idx, msg, silent)
 	if idx == 2 then
-		triggerbot2Pending = false
-		triggerbot2AwaitingCd = false
-		triggerUnconfirmed2 = 0
+		tbState.pending2 = false
+		tbState.awaitingCd2 = false
+		tbState.unconfirmed2 = 0
 	else
-		triggerbot1Pending = false
-		triggerbotAwaitingCd = false
-		triggerUnconfirmed = 0
+		tbState.pending1 = false
+		tbState.awaitingCd = false
+		tbState.unconfirmed = 0
 	end
-	if not triggerbot1Pending and not triggerbot2Pending then
-		triggerbotMarkPlayer = nil
-		triggerbotMarkChar = nil
-		triggerbotWasBlocking = false
+	if not tbState.pending1 and not tbState.pending2 then
+		tbState.markPlayer = nil
+		tbState.markChar = nil
+		tbState.wasBlocking = false
 		if triggerMarkGui then triggerMarkGui.Enabled = false end
 	end
 	autoSaveSettings()
@@ -8271,7 +8324,7 @@ clearTriggerRequest = function(idx, msg, silent)
 	pcall(function()
 		game:GetService("StarterGui"):SetCore("SendNotification", {
 			Title = "Triggerbot",
-			Text = msg or ("Move fired (slot " .. ((idx == 2) and triggerbot2Slot or triggerbotSlot) .. ")"),
+			Text = msg or ("Move fired (slot " .. ((idx == 2) and tbState.slot2 or tbState.slot) .. ")"),
 			Duration = 2
 		})
 	end)
@@ -8282,71 +8335,71 @@ end
 -- confirms via that slot's cooldown, retries swallowed presses and clears
 -- the request once resolved.
 local function evalTriggerChannel(idx, now, markChanged, justUnblocked)
-	local slot = (idx == 2) and triggerbot2Slot or triggerbotSlot
-	local pending = (idx == 2) and triggerbot2Pending or triggerbot1Pending
+	local slot = (idx == 2) and tbState.slot2 or tbState.slot
+	local pending = (idx == 2) and tbState.pending2 or tbState.pending1
 	if not pending then return end
-	local requestTime = (idx == 2) and triggerbot2RequestTime or triggerbot1RequestTime
-	if now - requestTime > triggerPendingTimeout then
-		clearTriggerRequest(idx, nil, true)
+	local requestTime = (idx == 2) and tbState.req2 or tbState.req1
+	if now - requestTime > tbState.pendingTimeout then
+		tbState.clearRequest(idx, nil, true)
 		return
 	end
-	if (idx == 2) and triggerbot2AwaitingCd or (idx ~= 2) and triggerbotAwaitingCd then
+	if (idx == 2) and tbState.awaitingCd2 or (idx ~= 2) and tbState.awaitingCd then
 		if isOwnSlotOnCooldown(slot) then
-			clearTriggerRequest(idx)
+			tbState.clearRequest(idx)
 		else
-			local pressTime = (idx == 2) and triggerbot2PressTime or triggerbotPressTime
-			if now - pressTime > triggerCdTimeout then
+			local pressTime = (idx == 2) and tbState.pressTime2 or tbState.pressTime
+			if now - pressTime > tbState.cdTimeout then
 				if idx == 2 then
-					triggerbot2AwaitingCd = false
-					triggerUnconfirmed2 = triggerUnconfirmed2 + 1
-					if triggerUnconfirmed2 >= triggerMaxUnconfirmed then
-						clearTriggerRequest(idx, "Triggerbot gave up (no cooldown detected)")
+					tbState.awaitingCd2 = false
+					tbState.unconfirmed2 = tbState.unconfirmed2 + 1
+					if tbState.unconfirmed2 >= tbState.maxUnconfirmed then
+						tbState.clearRequest(idx, "Triggerbot gave up (no cooldown detected)")
 					end
 				else
-					triggerbotAwaitingCd = false
-					triggerUnconfirmed = triggerUnconfirmed + 1
-					if triggerUnconfirmed >= triggerMaxUnconfirmed then
-						clearTriggerRequest(idx, "Triggerbot gave up (no cooldown detected)")
+					tbState.awaitingCd = false
+					tbState.unconfirmed = tbState.unconfirmed + 1
+					if tbState.unconfirmed >= tbState.maxUnconfirmed then
+						tbState.clearRequest(idx, "Triggerbot gave up (no cooldown detected)")
 					end
 				end
 			end
 		end
 		return
 	end
-	local lastFire = (idx == 2) and lastTriggerFire2 or lastTriggerFire
-	if markChanged or justUnblocked or (now - lastFire > triggerRefire) then
+	local lastFire = (idx == 2) and tbState.lastFire2 or tbState.lastFire
+	if markChanged or justUnblocked or (now - lastFire > tbState.refire) then
 		if isOwnSlotOnCooldown(slot) then
 			-- Own move still cooling: hold (stay armed) until it is ready
 			return
 		end
-		if idx == 2 then lastTriggerFire2 = now else lastTriggerFire = now end
+		if idx == 2 then tbState.lastFire2 = now else tbState.lastFire = now end
 		fireSkillKey(slot)
 		if getOwnSlotConfig(slot) then
 			if idx == 2 then
-				triggerbot2AwaitingCd = true
-				triggerbot2PressTime = now
+				tbState.awaitingCd2 = true
+				tbState.pressTime2 = now
 			else
-				triggerbotAwaitingCd = true
-				triggerbotPressTime = now
+				tbState.awaitingCd = true
+				tbState.pressTime = now
 			end
 		else
 			-- Slot has no trackable cooldown state: assume the press landed
-			clearTriggerRequest(idx)
+			tbState.clearRequest(idx)
 		end
 	end
 end
 
 	table.insert(connections, RunService.RenderStepped:Connect(function()
-	if not triggerbotEnabled then
+	if not tbState.enabled then
 		if triggerMarkGui then triggerMarkGui.Enabled = false end
-		triggerbotMarkPlayer = nil
-		triggerbotMarkChar = nil
-		triggerbotWasBlocking = false
-		triggerbotAwaitingCd = false
-		triggerbot2AwaitingCd = false
-		triggerbot1Pending = false
-		triggerbot2Pending = false
-		triggerbotRetarget = false
+		tbState.markPlayer = nil
+		tbState.markChar = nil
+		tbState.wasBlocking = false
+		tbState.awaitingCd = false
+		tbState.awaitingCd2 = false
+		tbState.pending1 = false
+		tbState.pending2 = false
+		tbState.retarget = false
 		return
 	end
 
@@ -8354,9 +8407,9 @@ end
 	local myHum = myChar and myChar:FindFirstChildOfClass("Humanoid")
 	if not myChar or not myHum or myHum.Health <= 0 then
 		if triggerMarkGui then triggerMarkGui.Enabled = false end
-		triggerbotMarkPlayer = nil
-		triggerbotMarkChar = nil
-		triggerbotWasBlocking = false
+		tbState.markPlayer = nil
+		tbState.markChar = nil
+		tbState.wasBlocking = false
 		return
 	end
 
@@ -8365,38 +8418,38 @@ end
 	-- now; while a request waits with nothing locked, the live cursor keeps
 	-- trying (early presses still catch a target that walks in). No requests,
 	-- no lock — so the mark can never linger while the toggle just sits on.
-	if triggerbotRetarget then
-		triggerbotRetarget = false
-		triggerbotMarkPlayer = nil
-		triggerbotMarkChar = nil
-		triggerbotWasBlocking = false
-		triggerbotAwaitingCd = false
-		triggerUnconfirmed = 0
-		triggerbot2AwaitingCd = false
-		triggerUnconfirmed2 = 0
+	if tbState.retarget then
+		tbState.retarget = false
+		tbState.markPlayer = nil
+		tbState.markChar = nil
+		tbState.wasBlocking = false
+		tbState.awaitingCd = false
+		tbState.unconfirmed = 0
+		tbState.awaitingCd2 = false
+		tbState.unconfirmed2 = 0
 	end
 	local markChanged = false
-	if not triggerbotMarkPlayer or not triggerbotMarkPlayer.Parent then
-		triggerbotMarkPlayer = nil
-		triggerbotMarkChar = nil
-		triggerbotWasBlocking = false
-		triggerbotAwaitingCd = false
-		triggerUnconfirmed = 0
-		triggerbot2AwaitingCd = false
-		triggerUnconfirmed2 = 0
-		if triggerbot1Pending or triggerbot2Pending then
+	if not tbState.markPlayer or not tbState.markPlayer.Parent then
+		tbState.markPlayer = nil
+		tbState.markChar = nil
+		tbState.wasBlocking = false
+		tbState.awaitingCd = false
+		tbState.unconfirmed = 0
+		tbState.awaitingCd2 = false
+		tbState.unconfirmed2 = 0
+		if tbState.pending1 or tbState.pending2 then
 			local markHrp = getTargetNearCursor(150)
 			local markPlayer = (markHrp and markHrp.Parent) and Players:GetPlayerFromCharacter(markHrp.Parent) or nil
 			if markPlayer and (not markPlayer.Character or markPlayer.Character ~= markHrp.Parent) then
 				markPlayer = nil
 			end
 			if markPlayer then
-				triggerbotMarkPlayer = markPlayer
+				tbState.markPlayer = markPlayer
 				markChanged = true
 			end
 		end
 	end
-	local markPlayer = triggerbotMarkPlayer
+	local markPlayer = tbState.markPlayer
 
 	if markPlayer and markPlayer.Character then
 		local head = getTriggerHead(markPlayer.Character)
@@ -8412,17 +8465,17 @@ end
 
 	if not markPlayer or not markPlayer.Character then return end
 	local mchar = markPlayer.Character
-	if triggerbotMarkChar ~= mchar then
-		triggerbotMarkChar = mchar
-		triggerbotWasBlocking = false
+	if tbState.markChar ~= mchar then
+		tbState.markChar = mchar
+		tbState.wasBlocking = false
 		markChanged = true
 	end
 	local mhum = mchar:FindFirstChildOfClass("Humanoid")
 	if not mhum or mhum.Health <= 0 then return end
 
 	local blocking = isTriggerBlocking(mchar)
-	local justUnblocked = triggerbotWasBlocking and not blocking
-	triggerbotWasBlocking = blocking
+	local justUnblocked = tbState.wasBlocking and not blocking
+	tbState.wasBlocking = blocking
 	if blocking then return end
 
 	-- On-screen gate: only fire while the locked target is actually on screen,
@@ -8472,8 +8525,8 @@ end
 table.insert(connections, RunService.RenderStepped:Connect(function()
 	if not autoPlayEnabled then return end
 	local now = os.clock()
-	if now - lastAutoM1Time < autoM1Interval then return end
-	if autoPlayEnabled and now - skillFiredTime < skillM1LockoutDuration then return end
+	if now - autoState.lastAutoM1Time < autoState.autoM1Interval then return end
+	if autoPlayEnabled and now - autoState.skillFiredTime < autoState.skillM1Lockout then return end
 
 	local char = LocalPlayer.Character
 	if not char then return end
@@ -8494,7 +8547,7 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 	end
 	if not inRange then return end
 
-	lastAutoM1Time = now
+	autoState.lastAutoM1Time = now
 	fireAutoM1()
 end))
 
@@ -8529,33 +8582,33 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 	if autoPlayEnabled then
 		local target = getClosestPlayer()
 		if target then
-			autoLockTarget = target
-			autoLockActive = true
+			autoState.lockTarget = target
+			autoState.lockActive = true
 		else
-			autoLockTarget = nil
-			autoLockActive = false
+			autoState.lockTarget = nil
+			autoState.lockActive = false
 		end
 	else
-		autoLockTarget = nil
-		autoLockActive = false
+		autoState.lockTarget = nil
+		autoState.lockActive = false
 	end
 end))
 
 -- Separate camera lock RenderStepped for auto lock
 table.insert(connections, RunService.RenderStepped:Connect(function()
-	if not autoLockActive or not autoLockTarget or not autoLockTarget.Parent then return end
+	if not autoState.lockActive or not autoState.lockTarget or not autoState.lockTarget.Parent then return end
 
-	local targetPlayer = Players:GetPlayerFromCharacter(autoLockTarget.Parent)
+	local targetPlayer = Players:GetPlayerFromCharacter(autoState.lockTarget.Parent)
 	if teamCheckEnabled and targetPlayer and isTeammate(targetPlayer) then
-		autoLockTarget = nil
-		autoLockActive = false
+		autoState.lockTarget = nil
+		autoState.lockActive = false
 		return
 	end
 
 	local currentPos = Camera.CFrame.Position
-	local targetPos = autoLockTarget.Position
+	local targetPos = autoState.lockTarget.Position
 	if predictionEnabled then
-		targetPos = targetPos + autoLockTarget.Velocity * predictionStrength
+		targetPos = targetPos + autoState.lockTarget.Velocity * predictionStrength
 	end
 
 	local targetCFrame = CFrame.new(currentPos, targetPos)
@@ -8573,9 +8626,9 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 	local bar = ultBar:FindFirstChild("Bar")
 	if not bar then return end
 	if bar.Size.X.Scale < 1 then return end
-	if os.clock() - lastAutoModeGTime < 0.5 then return end
+	if os.clock() - autoState.lastModeGTime < 0.5 then return end
 
-	lastAutoModeGTime = os.clock()
+	autoState.lastModeGTime = os.clock()
 	VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.G, false, game)
 	VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.G, false, game)
 end))
@@ -8642,7 +8695,7 @@ end))
 local lastSprintPress = 0
 local sprintKeyHeld = false
 table.insert(connections, RunService.RenderStepped:Connect(function()
-	if autoSprintEnabled then
+	if autoState.sprintEnabled then
 		local char = LocalPlayer.Character
 		if char then
 			local hum = char:FindFirstChildOfClass("Humanoid")
@@ -8757,16 +8810,16 @@ function isPlayingTargetAnim(char)
 end
 ;(function()
 	function showTargetAlert()
-		if not targetEspEnabled then return end
+		if not espState.targetEnabled then return end
 		if not LocalPlayer.Character then return end
-		if targetEspAlertTime > 0 and os.clock() - targetEspAlertTime < 3 then return end
+		if espState.targetAlertTime > 0 and os.clock() - espState.targetAlertTime < 3 then return end
 		local head = getCharacterHeadNonYielding(LocalPlayer.Character)
 		if not head then return end
 
-		targetEspAlertTime = os.clock()
+		espState.targetAlertTime = os.clock()
 
-		if targetEspBillboard and targetEspBillboard.Parent then
-			targetEspBillboard.Adornee = head
+		if espState.targetBillboard and espState.targetBillboard.Parent then
+			espState.targetBillboard.Adornee = head
 			if targetEspScale then
 				targetEspScale.Scale = 0
 				TweenService:Create(targetEspScale, TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Scale = 1}):Play()
@@ -8807,7 +8860,7 @@ end
 		textConstraint.MaxTextSize = 60
 		textConstraint.Parent = Label
 
-		targetEspBillboard = Billboard
+		espState.targetBillboard = Billboard
 		targetEspScale = scale
 		targetEspLabel = Label
 
@@ -8816,10 +8869,10 @@ end
 	end
 
 	local function hideTargetAlert()
-		local billboard = targetEspBillboard
+		local billboard = espState.targetBillboard
 		local scale = targetEspScale
 		local label = targetEspLabel
-		targetEspBillboard = nil
+		espState.targetBillboard = nil
 		targetEspScale = nil
 		targetEspLabel = nil
 		if billboard and billboard.Parent then
@@ -8833,20 +8886,20 @@ end
 				TweenService:Create(label, TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {TextTransparency = 1, TextStrokeTransparency = 1}):Play()
 			end
 		end
-		targetEspAlertTime = 0
+		espState.targetAlertTime = 0
 	end
 
 	-- Alert visibility loop
 	task.spawn(function()
 		while true do
 			task.wait(0.1)
-			if targetEspEnabled and targetEspAlertTime > 0 then
-				if os.clock() - targetEspAlertTime <= 1.5 then
-					if not targetEspBillboard or not targetEspBillboard.Parent then
+			if espState.targetEnabled and espState.targetAlertTime > 0 then
+				if os.clock() - espState.targetAlertTime <= 1.5 then
+					if not espState.targetBillboard or not espState.targetBillboard.Parent then
 						showTargetAlert()
 					elseif LocalPlayer.Character then
 						local head = getCharacterHeadNonYielding(LocalPlayer.Character)
-						if head then targetEspBillboard.Adornee = head end
+						if head then espState.targetBillboard.Adornee = head end
 					end
 				else
 					hideTargetAlert()
@@ -8898,7 +8951,7 @@ end
 				if not player or player == LocalPlayer then return end
 				if teamCheckEnabled and isTeammate(player) then return end
 				local actionFolder = char:WaitForChild("Action", 5)
-				if not actionFolder or not targetEspEnabled then return end
+				if not actionFolder or not espState.targetEnabled then return end
 				if isPlayingTargetAnim(char) and isLocalPlayerClosestTarget(char) then
 					showTargetAlert()
 					do end
@@ -8918,7 +8971,7 @@ end
 
 	-- RenderStepped loop: watch all enemies for target anim + Action state
 	table.insert(connections, RunService.RenderStepped:Connect(function()
-		if not targetEspEnabled then return end
+		if not espState.targetEnabled then return end
 		if not LocalPlayer.Character then return end
 		local myHRP = LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
 		if not myHRP then return end
@@ -8929,9 +8982,9 @@ end
 			if not char then continue end
 			if not char:FindFirstChild("Action") then continue end
 			if isPlayingTargetAnim(char) and isLocalPlayerClosestTarget(char) then
-				if targetEspBillboard and targetEspBillboard.Parent and LocalPlayer.Character then
+				if espState.targetBillboard and espState.targetBillboard.Parent and LocalPlayer.Character then
 					local head = getCharacterHeadNonYielding(LocalPlayer.Character)
-					if head then targetEspBillboard.Adornee = head end
+					if head then espState.targetBillboard.Adornee = head end
 				end
 			end
 		end
@@ -9048,7 +9101,7 @@ table.insert(connections, game.DescendantAdded:Connect(function(obj)
 		return
 	end
 	if teamCheckEnabled and isTeammate(player) then return end
-	if targetEspEnabled and LocalPlayer.Character and targetEspSkillNames[skillName] and isLocalPlayerClosestTarget(char) then
+	if espState.targetEnabled and LocalPlayer.Character and targetEspSkillNames[skillName] and isLocalPlayerClosestTarget(char) then
 		task.spawn(function()
 			task.wait(0.03)
 			if char and char.Parent and isPlayingTargetAnim(char) then
@@ -9056,8 +9109,8 @@ table.insert(connections, game.DescendantAdded:Connect(function(obj)
 			end
 		end)
 	end
-	if not moveInputsEnabled then return end
-	moveFlashTimes[player.Name .. "_" .. skillName] = os.clock()
+	if not espState.inputsEnabled then return end
+	cdState.flashTimes[player.Name .. "_" .. skillName] = os.clock()
 end))
 end
 
