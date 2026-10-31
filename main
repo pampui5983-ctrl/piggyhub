@@ -6567,6 +6567,13 @@ local sharedM1AnimIds = {
 	["14272246471"] = true, ["14272212914"] = true,
 	["14272266117"] = true, ["14272296104"] = true,
 	["1470472673"] = true,
+	-- live-captured M1 sets (two characters, verified by repeat chains):
+	["96861809128457"] = true, ["70631643696021"] = true,	-- char 1 M1 combo (hits 1-2)
+	["76161438769781"] = true, ["79268589678458"] = true,	-- char 1 M1 combo (hits 3-4)
+	["71448680970765"] = true, ["112059662449814"] = true,	-- char 1 M1 combo (hit 5 + finisher)
+	["129710126229098"] = true, ["112644670109209"] = true,	-- char 2 M1 combo (hits 1-2)
+	["76942529657697"] = true, ["132283855873180"] = true,	-- char 2 M1 combo (hits 3-4)
+	["91753737785074"] = true,								-- char 2 M1 combo (hit 5)
 }
 counterDiagSharedM1Ids = sharedM1AnimIds
 
