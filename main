@@ -139,6 +139,13 @@ local lastCounterTime = 0
 -- counterGen: shared by onBlockImpact/airSwingFire so only the newest counter owns transitioningToCounter.
 local blockGen = 0
 local counterGen = 0
+-- Owner of the transitioningToCounter latch: counterGen snapshot taken when a
+-- counter claims the transition. COUNTER_ABORT paths used to `return` without
+-- clearing the flag, latching it true for the rest of the run -- which buried
+-- checkShouldBlock (AutoBlock + its 1s stuck-blocking force-clear), the Air
+-- Swing loop and every future parry until re-execution. Abort exits now clear
+-- the latch only while it still belongs to them.
+local transitionOwnerGen = 0
 local userHoldingF = false
 -- Exact echo accounting for synthetic F presses (measured live: every virtual
 -- press echoes exactly once into InputBegan/InputEnded, and IsKeyDown tracks
@@ -7015,6 +7022,7 @@ local function airSwingFire()
 	counterTransitionWarned = false
 	counterGen = counterGen + 1
 	local myGen = counterGen
+	transitionOwnerGen = myGen
 	blockGen = blockGen + 1 -- invalidate any in-flight parry tap so it can't release this sequence
 	lastCounterTime = os.clock()
 	-- Physical finger only: IsKeyDown sees our own synthetic holds too, which is
@@ -7068,6 +7076,18 @@ local function airSwingFire()
 			counterDiag("COUNTER_ABORT", "src=airswing", "gen=" .. tostring(myGen),
 				"counterGen=" .. tostring(counterGen), "leakRisk=true", "stage=post-task",
 				"transitioning=" .. tostring(transitioningToCounter), counterDiagBlocking())
+			-- Abort-path latch fix: while we still own the flag (no newer counter
+			-- claimed it), release instead of leaving it latched true. A latched
+			-- flag wedged checkShouldBlock -- including its 1s stuck-blocking
+			-- force-clear, which sits behind the transitioning gate -- and killed
+			-- the Air Swing loop and every future parry until re-execute. The
+			-- inner COUNTER_ABORT returns funnel into this check, so this one
+			-- clear rescues the whole task.
+			if transitionOwnerGen == myGen then
+				transitioningToCounter = false
+				counterDiag("TRANSITION_CLEAR", "src=airswing", "gen=" .. tostring(myGen),
+					counterDiagBlocking())
+			end
 			return
 		end
 		transitioningToCounter = false
@@ -7183,6 +7203,7 @@ local function setupGlobalCounterListener()
 		counterGen = counterGen + 1
 		local myGen = counterGen
 		blockGen = blockGen + 1 -- invalidate any in-flight parry tap so it can't release this sequence
+		transitionOwnerGen = myGen
 		airSwingArmed = nil -- impact owns this moment: drop any air tracking, no double punish
 
 		-- Physical finger only (fix 2): IsKeyDown also sees our own synthetic
@@ -7237,6 +7258,15 @@ local function setupGlobalCounterListener()
 				counterDiag("COUNTER_ABORT", "src=impact", "gen=" .. tostring(myGen),
 					"counterGen=" .. tostring(counterGen), "leakRisk=true", "stage=post-task",
 					"transitioning=" .. tostring(transitioningToCounter), counterDiagBlocking())
+				-- Abort-path latch fix (mirrors the airswing clear): releasing a
+				-- latch we still own instead of leaking it. E.g. a user F release
+				-- mid-counter bumps counterGen (F_UP_BUMP) and aborts us -- the
+				-- flag must not outlive this task or Auto Block stays dead.
+				if transitionOwnerGen == myGen then
+					transitioningToCounter = false
+					counterDiag("TRANSITION_CLEAR", "src=impact", "gen=" .. tostring(myGen),
+						counterDiagBlocking())
+				end
 				return
 			end
 			if not success then
