@@ -5588,6 +5588,28 @@ table.insert(connections, RunService.Heartbeat:Connect(function()
 end))
 
 
+-- M1 variant fix: the server picks the M1 variant from the `air` flag we claim
+-- in the payload plus the REAL Space key state it already tracks from our
+-- movement packets (not from our `skeydown` field):
+--   air=false + real Space held -> uptilt       (legit, ground only)
+--   air=true  + real Space held -> aerial basic (the "basic m1s in air")
+--   air=false + no Space        -> basic chain
+--   air=true  + no Space        -> downtilt
+-- Hardcoding `air = false` made our swings uptilt mid-air whenever Space was
+-- held (live-verified: uptilt fired + 14.4 stud launch vs identical setup with
+-- a truthful claim => plain chain punch, no launch). We claim air truthfully
+-- ONLY when actually airborne with Space held; every other case keeps the old
+-- grounded claim so ground behavior is untouched.
+local function airClaimFor(char)
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if hum and hum.FloorMaterial == Enum.Material.Air then
+		if UserInputService:IsKeyDown(Enum.KeyCode.Space) then
+			return true
+		end
+	end
+	return false
+end
+
 local lastFired = 0
 local function fireBlackFlashM1()
 	local now = tick()
@@ -5605,7 +5627,7 @@ local function fireBlackFlashM1()
 	if not root then return end
 
 	input:FireServer("M1", {
-		air = false,
+		air = airClaimFor(char),
 		mousehit = root.CFrame,
 		md = Vector3.zero,
 		dodgevelo = nil,
@@ -6775,6 +6797,48 @@ if sharedM1AnimIds[animIdNum] then
 				end
 end
 end
+
+		-- Dummy watch (test surface, ABA): Workspace.Live NPC models (Downslam
+		-- Dummy, Attack Dummy, ...) swing with the same M1 tracks players use.
+		-- Player characters also live in Live, so skip any Model that maps back
+		-- to a Player (the loop above already covers those). Same distance gate
+		-- as players, same lastBlockedAnims dedup, attribution src=dummy.
+		do
+			local live = workspace:FindFirstChild("Live")
+			if live then
+				for _, npc in ipairs(live:GetChildren()) do
+					if npc:IsA("Model") and not Players:GetPlayerFromCharacter(npc) then
+						local npcHum = npc:FindFirstChildOfClass("Humanoid")
+						local npcHrp = npc:FindFirstChild("HumanoidRootPart")
+						if npcHum and npcHrp and npcHum.Health > 0 then
+							local npcDist = (npcHrp.Position - localHrp.Position).Magnitude
+							if npcDist <= 18 then
+								local npcAnimator = npcHum:FindFirstChildOfClass("Animator")
+								local npcTracks = npcAnimator and npcAnimator:GetPlayingAnimationTracks() or npcHum:GetPlayingAnimationTracks()
+								for _, track in ipairs(npcTracks) do
+									local animId = track.Animation and track.Animation.AnimationId
+									if not animId then continue end
+									local dup = false
+									for _, item in ipairs(lastBlockedAnims) do
+										if item.Track == track then dup = true; break end
+									end
+									if dup then continue end
+									local animIdNum = (tostring(animId):match("%d+")) or ""
+									if sharedM1AnimIds[animIdNum] then
+										table.insert(lastBlockedAnims, { Track = track, Time = os.clock() })
+										counterDiag("BLOCK_DETECT", "src=dummy", "npc=" .. tostring(npc.Name),
+											"name=" .. tostring(track.Name), "id=" .. tostring(animId),
+											string.format("dist=%.1f", npcDist), "blockTapDelay=" .. tostring(blockTapDelay),
+											"holdForCounter=" .. tostring(autoCounterEnabled and blockHoldForCounter or blockTapDuration))
+										return true, track
+									end
+								end
+							end
+						end
+					end
+				end
+			end
+		end
 end
 
 local function triggerCounterM1(tag)
@@ -6791,7 +6855,7 @@ local function triggerCounterM1(tag)
 			if root then
 			counterDiag("M1_PATH", "src=" .. tostring(tag or "?"), "path=input:FireServer")
 			input:FireServer("M1", {
-				air = false,
+				air = airClaimFor(char),
 				mousehit = root.CFrame,
 				md = Vector3.zero,
 				dodgevelo = nil,
@@ -8549,7 +8613,7 @@ local function fireAutoM1()
 
 	pcall(function()
 		input:FireServer("M1", {
-			air = false,
+			air = airClaimFor(char),
 			mousehit = root.CFrame,
 			md = Vector3.zero,
 			dodgevelo = nil,
