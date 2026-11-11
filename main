@@ -67,14 +67,15 @@ local tbState = {
 	markPlayer = nil, -- was triggerbotMarkPlayer
 	markChar = nil, -- was triggerbotMarkChar
 	wasBlocking = false, -- was triggerbotWasBlocking
+	unblockOnUse = false, -- drop our guard before firing when the target drops theirs
 	lastFire = 0, -- was lastTriggerFire
 	lastFire2 = 0, -- was lastTriggerFire2
-	refire = 0.1, -- was triggerRefire
+	refire = 0.2, -- was triggerRefire; repeated-attempt cadence while the target is not blocking
 	awaitingCd = false, -- was triggerbotAwaitingCd
 	pressTime = 0, -- was triggerbotPressTime
 	awaitingCd2 = false, -- was triggerbot2AwaitingCd
 	pressTime2 = 0, -- was triggerbot2PressTime
-	cdTimeout = 1.5, -- was triggerCdTimeout
+	cdTimeout = 0.2, -- was triggerCdTimeout; a press with no COOLDOWN attribute after this is treated as eaten and retried
 	unconfirmed = 0, -- was triggerUnconfirmed
 	unconfirmed2 = 0, -- was triggerUnconfirmed2
 	maxUnconfirmed = 5, -- was triggerMaxUnconfirmed
@@ -430,9 +431,25 @@ counterDiag("DIAG_READY", "on=" .. tostring(counterDiagEnv.PiggyCounterDiagOn),
 
 -- Script-owned F presses expect exactly one InputBegan/Ended echo each, so the
 -- userHoldingF tracker below can tell synthetic presses apart from a physical
--- finger with no timing blind spots and no IsKeyDown polling. Zero delay:
--- bookkeeping happens inline, no waits added to any block/counter path.
+-- finger. CRITICAL: Roblox fires InputBegan/InputEnded only on real up->down /
+-- down->up transitions, so a VIM send while the engine already holds that state
+-- produces NO echo and leaves a stale credit that then EATS the user's next
+-- genuine press/release (userHoldingF desync -> the stuck block that only a
+-- repress+release clears; the post-counter REPRESS paths used to hit this every
+-- time the finger was still down). Both senders therefore no-op when the
+-- engine state already matches the request -- exactly when the event would do
+-- nothing. A pending (in-flight) send disables the skip so a queued down/up
+-- pair still lands in order.
 local function scriptFDown()
+	local alreadyDown = false
+	pcall(function()
+		alreadyDown = (pendingUpEcho == 0) and UserInputService:IsKeyDown(Enum.KeyCode.F)
+	end)
+	if alreadyDown then
+		counterDiag("SCRIPT_F_DOWN_SKIP", "reason=alreadyDown",
+			"blockingState=" .. tostring(blockingState), "transitioning=" .. tostring(transitioningToCounter))
+		return
+	end
 	pendingDownEcho = pendingDownEcho + 1
 	lastDownStamp = os.clock()
 	counterDiag("SCRIPT_F_DOWN", "pendingDown=" .. tostring(pendingDownEcho),
@@ -440,6 +457,15 @@ local function scriptFDown()
 	pcall(function() VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game) end)
 end
 local function scriptFUp()
+	local alreadyUp = false
+	pcall(function()
+		alreadyUp = (pendingDownEcho == 0) and (not UserInputService:IsKeyDown(Enum.KeyCode.F))
+	end)
+	if alreadyUp then
+		counterDiag("SCRIPT_F_UP_SKIP", "reason=alreadyUp",
+			"blockingState=" .. tostring(blockingState), "transitioning=" .. tostring(transitioningToCounter))
+		return
+	end
 	pendingUpEcho = pendingUpEcho + 1
 	lastUpStamp = os.clock()
 	counterDiag("SCRIPT_F_UP", "pendingUp=" .. tostring(pendingUpEcho),
@@ -485,7 +511,14 @@ table.insert(connections, UserInputService.InputEnded:Connect(function(input)
 				"LEAK_WINDOW=" .. tostring(transitioningToCounter))
 			scriptFUp()
 		else
-			counterDiag("F_UP_PHYS_IGNORED", "reason=userHoldingF=false")
+			-- Recovery: a physical release while we track nobody holding F
+			-- usually means a stale echo ate the press (REPRESS desync) and the
+			-- engine may still be blocking from an untracked synthetic down.
+			-- scriptFUp skips true no-ops, so this only fires a real release
+			-- when the engine is genuinely stuck down -- the block now
+			-- self-heals here instead of waiting for a repress+release cycle.
+			counterDiag("F_UP_PHYS_IGNORED", "reason=userHoldingF=false", "recover=scriptFUp")
+			scriptFUp()
 		end
 	end
 end))
@@ -1786,6 +1819,7 @@ function ConfigManager.collectSettings()
 		triggerbotSlot = tbState.slot,
 		triggerbot2Key = (tbState.key2 and tbState.key2.Name) or "None",
 		triggerbot2Slot = tbState.slot2,
+		triggerbotUnblockOnUse = tbState.unblockOnUse,
 		autoInfinityKey = (autoInfinityKey and autoInfinityKey.Name) or "None",
 		toggleUIKey = (toggleUIKey and toggleUIKey.Name) or "None",
 		autoBlackFlashEnabled = autoBlackFlashEnabled,
@@ -1895,6 +1929,7 @@ function ConfigManager.load(name)
 	if type(data.triggerbotSlot) == "number" then tbState.slot = math.clamp(math.floor(data.triggerbotSlot), 1, 4) end
 	if data.triggerbot2Key then tbState.key2 = decodeKeybind(data.triggerbot2Key, tbState.key2) end
 	if type(data.triggerbot2Slot) == "number" then tbState.slot2 = math.clamp(math.floor(data.triggerbot2Slot), 1, 4) end
+	tbState.unblockOnUse = data.triggerbotUnblockOnUse == true
 	if data.counterKey then counterKey = decodeKeybind(data.counterKey, counterKey) end
 	if data.autoInfinityKey then autoInfinityKey = decodeKeybind(data.autoInfinityKey, autoInfinityKey) end
 	if data.toggleUIKey then toggleUIKey = decodeKeybind(data.toggleUIKey, toggleUIKey) end
@@ -1987,6 +2022,7 @@ function ConfigManager.load(name)
 	if settingsRefs.triggerbotSlot then settingsRefs.triggerbotSlot.Set(tbState.slot) end
 	if settingsRefs.triggerbot2Key then settingsRefs.triggerbot2Key.Set(tbState.key2) end
 	if settingsRefs.triggerbot2Slot then settingsRefs.triggerbot2Slot.Set(tbState.slot2) end
+	if settingsRefs.triggerbotUnblockOnUse then settingsRefs.triggerbotUnblockOnUse.Set(tbState.unblockOnUse) end
 	if settingsRefs.counterKey then settingsRefs.counterKey.Set(counterKey) end
 	if settingsRefs.autoInfinityKey then settingsRefs.autoInfinityKey.Set(autoInfinityKey) end
 	if settingsRefs.toggleUIKey then settingsRefs.toggleUIKey.Set(toggleUIKey) end
@@ -4930,8 +4966,13 @@ do -- Move slot 2 dropdown (1-4): second triggerbot channel's move
     }
 end
 
-makeMiscHeader("Infinity", 650)
-local autoInfinityToggleObj = createToggle(tabFrames.misc, "AutoInfinity (JSON FILE)", 672, autoInfinityEnabled, function(state)
+settingsRefs.triggerbotUnblockOnUse = createToggle(tabFrames.misc, "Unblock on use", 644, tbState.unblockOnUse, function(state)
+    tbState.unblockOnUse = state
+    autoSaveSettings()
+end)
+
+makeMiscHeader("Infinity", 686)
+local autoInfinityToggleObj = createToggle(tabFrames.misc, "AutoInfinity (JSON FILE)", 708, autoInfinityEnabled, function(state)
     autoInfinityEnabled = state
     if state then
         autoInfinityLoadDatabase()
@@ -4945,32 +4986,32 @@ local autoInfinityToggleObj = createToggle(tabFrames.misc, "AutoInfinity (JSON F
 end)
 settingsRefs.autoInfinityEnabled = autoInfinityToggleObj
 
-settingsRefs.autoInfinityKey = createKeybind(tabFrames.misc, "AutoInfinity Keybind", 708, autoInfinityKey, function(key)
+settingsRefs.autoInfinityKey = createKeybind(tabFrames.misc, "AutoInfinity Keybind", 744, autoInfinityKey, function(key)
     autoInfinityKey = key
 end)
 
-settingsRefs.autoInfinityLookSensitivity = createSlider(tabFrames.misc, "Look sensitivity", 744, 0.1, 1.0, aiState.lookSensitivity, function(val)
+settingsRefs.autoInfinityLookSensitivity = createSlider(tabFrames.misc, "Look sensitivity", 780, 0.1, 1.0, aiState.lookSensitivity, function(val)
     aiState.lookSensitivity = val
 end, function(text, val)
     local deg = math.deg(math.acos(math.clamp(val, 0, 1)))
     return text .. ": " .. string.format("%.2f", val) .. string.format(" (%.0f degrees)", deg)
 end)
 
-settingsRefs.autoInfinityRayRadius = createSlider(tabFrames.misc, "Ray cast sensitivity", 792, 10, 100, aiState.rayRadius, function(val)
+settingsRefs.autoInfinityRayRadius = createSlider(tabFrames.misc, "Ray cast sensitivity", 828, 10, 100, aiState.rayRadius, function(val)
     aiState.rayRadius = val
 end)
 
-settingsRefs.autoInfinityUnlocked = createToggle(tabFrames.misc, "Autoinfinity unblock", 840, autoInfinityUnlocked, function(state)
+settingsRefs.autoInfinityUnlocked = createToggle(tabFrames.misc, "Autoinfinity unblock", 876, autoInfinityUnlocked, function(state)
     autoInfinityUnlocked = state
 end)
 
-makeMiscHeader("Utility", 878)
-settingsRefs.autoBlackFlashEnabled = createToggle(tabFrames.misc, "Auto Black Flash", 900, autoBlackFlashEnabled, function(state)
+makeMiscHeader("Utility", 914)
+settingsRefs.autoBlackFlashEnabled = createToggle(tabFrames.misc, "Auto Black Flash", 936, autoBlackFlashEnabled, function(state)
     autoBlackFlashEnabled = state
 	applyBlackFlashHook()
 end)
 
-settingsRefs.autoSprintEnabled = createToggle(tabFrames.misc, "Auto Sprint", 936, autoState.sprintEnabled, function(state)
+settingsRefs.autoSprintEnabled = createToggle(tabFrames.misc, "Auto Sprint", 972, autoState.sprintEnabled, function(state)
     autoState.sprintEnabled = state
     if not state and autoState.sprintHeld then
         autoState.sprintHeld = false
@@ -4978,11 +5019,11 @@ settingsRefs.autoSprintEnabled = createToggle(tabFrames.misc, "Auto Sprint", 936
     end
     autoSaveSettings()
 end)
-settingsRefs.autoPlayEnabled = createToggle(tabFrames.misc, "Auto Play", 972, autoPlayEnabled, function(state)
+settingsRefs.autoPlayEnabled = createToggle(tabFrames.misc, "Auto Play", 1008, autoPlayEnabled, function(state)
     autoPlayEnabled = state
 end)
 
-settingsRefs.toggleUIKey = createKeybind(tabFrames.misc, "Close/Open UI", 1008, toggleUIKey, function(key)
+settingsRefs.toggleUIKey = createKeybind(tabFrames.misc, "Close/Open UI", 1044, toggleUIKey, function(key)
     toggleUIKey = key
 end)
 
@@ -6649,6 +6690,12 @@ local function getStandHums(player)
 end
 
 local function checkShouldBlock()
+	-- Detection master gate: Auto Block owns swing detection for parry taps.
+	-- Auto Counter stays ISOLATED on purpose: with Auto Block off, counters
+	-- come from what arrives while YOU hold block (airswing punish via
+	-- findAirSwingTarget + block impacts via onBlockImpact) -- blocking stays
+	-- your choice. Dummies feed those paths through their own dummy scans in
+	-- findAirSwingTarget/isOpponentPlayingM1, not through this gate.
 	if not autoBlockEnabled then return false end
 	if transitioningToCounter then
 		counterDiagThrottled("shouldBlockTransition", 1, "CHECK_BLOCK_SKIP",
@@ -7072,6 +7119,44 @@ local function findAirSwingTarget(localHrp)
 			end
 		end
 	end
+		-- Dummy/NPC watch (Auto-Counter arm path): Workspace.Live dummies swing
+		-- with the same M1 tracks players use. With Auto Block off this is how a
+		-- dummy swing arms the punish while WE hold block -- and the
+		-- lastBlockedAnims insert here is also what lets onBlockImpact recognize
+		-- the dummy swing as M1 evidence (hasRecentM1). Player characters also
+		-- live in Live, so skip any Model that maps back to a Player.
+		do
+			local live = workspace:FindFirstChild("Live")
+			if live then
+				for _, npc in ipairs(live:GetChildren()) do
+					if npc:IsA("Model") and not Players:GetPlayerFromCharacter(npc) then
+						local npcHum = npc:FindFirstChildOfClass("Humanoid")
+						local npcHrp = npc:FindFirstChild("HumanoidRootPart")
+						if npcHum and npcHrp and npcHum.Health > 0 then
+							local npcDist = (npcHrp.Position - localHrp.Position).Magnitude
+							if npcDist <= swingRange then
+								local npcAnimator = npcHum:FindFirstChildOfClass("Animator")
+								local npcTracks = npcAnimator and npcAnimator:GetPlayingAnimationTracks() or npcHum:GetPlayingAnimationTracks()
+								for _, track in ipairs(npcTracks) do
+									local animId = track.Animation and track.Animation.AnimationId
+									if not animId then continue end
+									local dup = false
+									for _, item in ipairs(lastBlockedAnims) do
+										if item.Track == track then dup = true; break end
+									end
+									if dup then continue end
+									local animIdNum = (tostring(animId):match("%d+")) or ""
+									if sharedM1AnimIds[animIdNum] then
+										table.insert(lastBlockedAnims, { Track = track, Time = os.clock() })
+										return track, npcHrp
+									end
+								end
+							end
+						end
+					end
+				end
+			end
+		end
 	return nil
 end
 
@@ -7221,6 +7306,38 @@ local function setupGlobalCounterListener()
 						local idNum = tostring(animId):match("%d+") or ""
 						if sharedM1AnimIds[idNum] then
 							return true
+						end
+					end
+				end
+			end
+		end
+		-- Dummy/NPC fallback (impact evidence): onBlockImpact rejects without M1
+		-- evidence (hasRecentM1 cache or this live scan). Dummies were invisible
+		-- here, so with Auto Block off a dummy swing that hit our manually-held
+		-- block was rejected as noM1 -- the reason autocounter never fired on
+		-- dummies without autoblock. Skip player-owned models like above.
+		do
+			local live = workspace:FindFirstChild("Live")
+			if live then
+				for _, npc in ipairs(live:GetChildren()) do
+					if npc:IsA("Model") and not Players:GetPlayerFromCharacter(npc) then
+						local npcHum = npc:FindFirstChildOfClass("Humanoid")
+						local npcHrp = npc:FindFirstChild("HumanoidRootPart")
+						if npcHum and npcHrp and npcHum.Health > 0 then
+							local npcDist = (npcHrp.Position - localHrp.Position).Magnitude
+							if npcDist <= 30 then
+								local npcAnimator = npcHum:FindFirstChildOfClass("Animator")
+								local npcTracks = npcAnimator and npcAnimator:GetPlayingAnimationTracks() or npcHum:GetPlayingAnimationTracks()
+								for _, track in ipairs(npcTracks) do
+									local animId = track.Animation and track.Animation.AnimationId
+									if animId then
+										local idNum = tostring(animId):match("%d+") or ""
+										if sharedM1AnimIds[idNum] then
+											return true
+										end
+									end
+								end
+							end
 						end
 					end
 				end
@@ -8473,9 +8590,12 @@ local function evalTriggerChannel(idx, now, markChanged, justUnblocked)
 			-- Own move still cooling: hold (stay armed) until it is ready
 			return
 		end
+		-- Arm the fire IMMEDIATELY (lastFire + awaitingCd) so frames that run
+		-- during the unblock beat below cannot re-enter this branch and
+		-- double-press the slot.
 		if idx == 2 then tbState.lastFire2 = now else tbState.lastFire = now end
-		fireSkillKey(slot)
-		if getOwnSlotConfig(slot) then
+		local hasCdConfig = getOwnSlotConfig(slot) ~= nil
+		if hasCdConfig then
 			if idx == 2 then
 				tbState.awaitingCd2 = true
 				tbState.pressTime2 = now
@@ -8483,9 +8603,39 @@ local function evalTriggerChannel(idx, now, markChanged, justUnblocked)
 				tbState.awaitingCd = true
 				tbState.pressTime = now
 			end
-		else
+		end
+		-- "Unblock on use": our own guard makes the server eat skill presses,
+		-- so drop it first, give the drop a beat to register, then fire. Mirrors
+		-- the airswing counter's unblock/press/restore pattern.
+		local wasUserHolding = false
+		if tbState.unblockOnUse and isAirSwingHolding() then
+			wasUserHolding = userHoldingF
+			blockGen = blockGen + 1 -- kill in-flight parry taps so they cannot re-press or release over us
+			blockingState = false
+			scriptFUp()
+			counterDiag("TRIGGER_UNBLOCK", "src=triggerbot", "slot=" .. tostring(slot),
+				"wasUserHolding=" .. tostring(wasUserHolding))
+			task.wait(0.06)
+		end
+		fireSkillKey(slot)
+		if not hasCdConfig then
 			-- Slot has no trackable cooldown state: assume the press landed
 			tbState.clearRequest(idx)
+		end
+		-- Restore the guard only for a physical hold that never left: the
+		-- transition-aware scriptFDown skips if F is already down, and a lifted
+		-- finger simply stays unblocked (their next press re-blocks). The short
+		-- beat lets the skill press land before the block returns.
+		if tbState.unblockOnUse and wasUserHolding and userHoldingF then
+			task.wait(0.08)
+			if userHoldingF then
+				scriptFDown()
+				if autoBlockEnabled then
+					blockingState = true
+					blockStartTime = os.clock()
+				end
+				counterDiag("TRIGGER_REBLOCK", "src=triggerbot", "slot=" .. tostring(slot))
+			end
 		end
 	end
 end
@@ -8588,7 +8738,9 @@ end
 
 	-- Don't burn the one-shot while WE are blocking: the server swallows move
 	-- keys thrown from block, so hold (stay enabled) until we release instead.
-	if isAirSwingHolding() then return end
+	-- With "Unblock on use" on, the fire path drops our guard first, so let the
+	-- request through even while we are holding block.
+	if isAirSwingHolding() and not tbState.unblockOnUse then return end
 
 	local now = os.clock()
 	-- Cooldown confirmation per channel (see evalTriggerChannel): a press only
