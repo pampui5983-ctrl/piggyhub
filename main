@@ -8605,16 +8605,32 @@ local function evalTriggerChannel(idx, now, markChanged, justUnblocked)
 			end
 		end
 		-- "Unblock on use": our own guard makes the server eat skill presses,
-		-- so drop it first, give the drop a beat to register, then fire. Mirrors
-		-- the airswing counter's unblock/press/restore pattern.
+		-- so drop it first, give the drop a beat to register, then fire. The
+		-- sequence claims the SAME counter-transition latch the airswing/impact
+		-- counters use: checkShouldBlock, parry taps, the 1s stuck-clear and
+		-- other counters all sit behind that gate, so nothing re-presses or
+		-- releases F underneath us mid-sequence. Without it the 0.2s retry cycle
+		-- and the autoblock machinery fight over F every frame -- the same
+		-- interleaved-event desync that caused the old stuck block.
 		local wasUserHolding = false
-		if tbState.unblockOnUse and isAirSwingHolding() then
+		local hadScriptHold = false
+		local mySeq = 0
+		if tbState.unblockOnUse and isAirSwingHolding() and not transitioningToCounter then
 			wasUserHolding = userHoldingF
+			hadScriptHold = blockingState
+			counterGen = counterGen + 1 -- newest sequence owns the latch
+			mySeq = counterGen
+			transitionOwnerGen = mySeq
+			transitioningToCounter = true
+			counterTransitionStart = os.clock()
+			counterTransitionWarned = false
 			blockGen = blockGen + 1 -- kill in-flight parry taps so they cannot re-press or release over us
 			blockingState = false
 			scriptFUp()
 			counterDiag("TRIGGER_UNBLOCK", "src=triggerbot", "slot=" .. tostring(slot),
-				"wasUserHolding=" .. tostring(wasUserHolding))
+				"gen=" .. tostring(mySeq),
+				"wasUserHolding=" .. tostring(wasUserHolding),
+				"hadScriptHold=" .. tostring(hadScriptHold))
 			task.wait(0.06)
 		end
 		fireSkillKey(slot)
@@ -8622,19 +8638,42 @@ local function evalTriggerChannel(idx, now, markChanged, justUnblocked)
 			-- Slot has no trackable cooldown state: assume the press landed
 			tbState.clearRequest(idx)
 		end
-		-- Restore the guard only for a physical hold that never left: the
-		-- transition-aware scriptFDown skips if F is already down, and a lifted
-		-- finger simply stays unblocked (their next press re-blocks). The short
-		-- beat lets the skill press land before the block returns.
-		if tbState.unblockOnUse and wasUserHolding and userHoldingF then
-			task.wait(0.08)
-			if userHoldingF then
-				scriptFDown()
-				if autoBlockEnabled then
+		-- Restore the guard exactly like airSwingFire's REPRESS: a physical hold
+		-- that never left, or the script's own hold when autoblock owned the
+		-- block. The transition-aware scriptFDown skips if F is already down,
+		-- and a lifted finger simply stays unblocked (their next press
+		-- re-blocks). A real release mid-sequence bumps counterGen (F_UP_BUMP),
+		-- which aborts the restore below instead of re-pressing over the user.
+		if mySeq ~= 0 then
+			local seqOk, seqErr = pcall(function()
+				task.wait(0.08)
+				if mySeq ~= counterGen then return end
+				if wasUserHolding and userHoldingF then
+					scriptFDown()
+					if autoBlockEnabled then
+						blockingState = true
+						blockStartTime = os.clock()
+					end
+					counterDiag("TRIGGER_REBLOCK", "src=triggerbot", "slot=" .. tostring(slot),
+						"reason=fingerStillDown", "gen=" .. tostring(mySeq))
+				elseif hadScriptHold and autoBlockEnabled then
+					-- Resume the script's own hold (no finger involved).
+					scriptFDown()
 					blockingState = true
 					blockStartTime = os.clock()
+					counterDiag("TRIGGER_REBLOCK", "src=triggerbot", "slot=" .. tostring(slot),
+						"reason=hadScriptHold", "gen=" .. tostring(mySeq))
 				end
-				counterDiag("TRIGGER_REBLOCK", "src=triggerbot", "slot=" .. tostring(slot))
+			end)
+			if not seqOk then
+				counterDiag("TRIGGER_SEQ_ERROR", "src=triggerbot", tostring(seqErr))
+			end
+			-- Abort-safe latch release: only clear when we still own it, so a
+			-- newer counter can never have its latch stolen.
+			if transitionOwnerGen == mySeq then
+				transitioningToCounter = false
+				counterDiag("TRANSITION_CLEAR", "src=triggerbot", "gen=" .. tostring(mySeq),
+					string.format("heldFor=%.3f", os.clock() - counterTransitionStart))
 			end
 		end
 	end
