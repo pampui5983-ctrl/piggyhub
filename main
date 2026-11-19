@@ -452,9 +452,25 @@ local function scriptFDown()
 	end
 	pendingDownEcho = pendingDownEcho + 1
 	lastDownStamp = os.clock()
+	local myStamp = lastDownStamp
 	counterDiag("SCRIPT_F_DOWN", "pendingDown=" .. tostring(pendingDownEcho),
 		"blockingState=" .. tostring(blockingState), "transitioning=" .. tostring(transitioningToCounter))
 	pcall(function() VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game) end)
+	-- Swallow check: if the engine never transitions (the game can drop F events
+	-- mid-swing), the pending echo credit is stale -- cancel it shortly so it
+	-- cannot eat the user's next real press/release. A newer send invalidates
+	-- this check via the stamp comparison.
+	task.spawn(function()
+		task.wait(0.1)
+		if lastDownStamp ~= myStamp then return end
+		local isDown = false
+		pcall(function() isDown = UserInputService:IsKeyDown(Enum.KeyCode.F) end)
+		if not isDown and pendingDownEcho > 0 then
+			pendingDownEcho = pendingDownEcho - 1
+			counterDiag("SCRIPT_F_DOWN_CANCEL", "reason=noTransition",
+				"pendingDown=" .. tostring(pendingDownEcho), counterDiagBlocking())
+		end
+	end)
 end
 local function scriptFUp()
 	local alreadyUp = false
@@ -468,9 +484,24 @@ local function scriptFUp()
 	end
 	pendingUpEcho = pendingUpEcho + 1
 	lastUpStamp = os.clock()
+	local myStamp = lastUpStamp
 	counterDiag("SCRIPT_F_UP", "pendingUp=" .. tostring(pendingUpEcho),
 		"blockingState=" .. tostring(blockingState), "transitioning=" .. tostring(transitioningToCounter))
 	pcall(function() VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game) end)
+	-- Swallow check, symmetric with scriptFDown: a synthetic release the engine
+	-- never applied leaves a stale credit that would eat the user's next real
+	-- release -- cancel it if no transition happened.
+	task.spawn(function()
+		task.wait(0.1)
+		if lastUpStamp ~= myStamp then return end
+		local isDown = false
+		pcall(function() isDown = UserInputService:IsKeyDown(Enum.KeyCode.F) end)
+		if isDown and pendingUpEcho > 0 then
+			pendingUpEcho = pendingUpEcho - 1
+			counterDiag("SCRIPT_F_UP_CANCEL", "reason=noTransition",
+				"pendingUp=" .. tostring(pendingUpEcho), counterDiagBlocking())
+		end
+	end)
 end
 table.insert(connections, UserInputService.InputBegan:Connect(function(input, _gp)
 	if input.KeyCode == Enum.KeyCode.F and input.UserInputType == Enum.UserInputType.Keyboard then
@@ -7160,6 +7191,11 @@ local function findAirSwingTarget(localHrp)
 	return nil
 end
 
+-- Forward declaration: the post-swing block re-arm helper is defined after
+-- isTriggerBlocking (which it uses); the counter paths below call it at
+-- runtime, by which point the local is assigned.
+local scheduleBlockReArm
+
 local function airSwingFire()
 	airSwingArmed = nil
 	if transitioningToCounter then
@@ -7268,6 +7304,7 @@ local function airSwingFire()
 				"hadScriptHold=" .. tostring(hadScriptHold),
 				"autoBlockEnabled=" .. tostring(autoBlockEnabled))
 		end
+		scheduleBlockReArm(myGen, counterTransitionStart + 2.0)
 	end)
 end
 
@@ -7474,6 +7511,7 @@ local function setupGlobalCounterListener()
 					"wasUserHolding=" .. tostring(wasUserHolding),
 					"userHoldingF=" .. tostring(userHoldingF))
 			end
+			scheduleBlockReArm(myGen, counterTransitionStart + 2.0)
 		end)
 	end
 
@@ -8447,6 +8485,51 @@ local function isTriggerBlocking(char)
 	end
 	if char:GetAttribute("Blocking") == true then return true end
 	return false
+end
+
+-- Post-swing block re-arm (definition; see the forward declaration above).
+-- The counters re-press F ~0.1s after their first M1, which can land while our
+-- own swing animation is still running -- the game swallows F edges mid-swing,
+-- so a buffered block never comes out, and the engine-level F state that the
+-- swallowed press leaves behind also MASKS the user's next physical edges
+-- (no up->down transition = no event). Their rapid release+repress afterwards
+-- then does nothing and the block stays dead. This watchdog keeps re-edging F
+-- with a clean up->down pair while "F held but not blocking" holds, until the
+-- block finally comes out or the deadline passes. It watches the engine state
+-- too (IsKeyDown), so a desynced userHoldingF cannot hide the stuck signature.
+-- Bounded: ~2s deadline from the counter, at most 4 re-edges per watchdog.
+scheduleBlockReArm = function(myGen, deadline)
+	task.spawn(function()
+		local reEdges = 0
+		while os.clock() < deadline do
+			task.wait(0.3)
+			if myGen ~= counterGen then return end -- a newer sequence owns F
+			local char = LocalPlayer.Character
+			if not char then return end
+			local holding = false
+			pcall(function()
+				holding = userHoldingF or UserInputService:IsKeyDown(Enum.KeyCode.F)
+			end)
+			if not holding then continue end -- nobody wants block right now
+			if transitioningToCounter then continue end -- a sequence owns F
+			local blockingNow = false
+			pcall(function() blockingNow = isTriggerBlocking(char) end)
+			if blockingNow then continue end -- block is up: nothing to do
+			if reEdges >= 4 then return end
+			reEdges = reEdges + 1
+			counterDiag("BLOCK_REARM", "src=counter", "gen=" .. tostring(myGen),
+				"reEdges=" .. tostring(reEdges),
+				string.format("deadlineIn=%.2f", deadline - os.clock()))
+			scriptFUp()
+			task.wait(0.03)
+			if myGen ~= counterGen then return end -- superseded mid-edge
+			scriptFDown()
+			if autoBlockEnabled then
+				blockingState = true
+				blockStartTime = os.clock()
+			end
+		end
+	end)
 end
 
 local function getTriggerHead(character)
