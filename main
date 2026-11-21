@@ -508,6 +508,10 @@ local function scriptFUp()
 end
 table.insert(connections, UserInputService.InputBegan:Connect(function(input, _gp)
 	if input.KeyCode == Enum.KeyCode.F and input.UserInputType == Enum.UserInputType.Keyboard then
+		counterDiag("F_BEGIN_EV", "pD=" .. tostring(pendingDownEcho),
+			"pU=" .. tostring(pendingUpEcho),
+			"hold=" .. tostring(userHoldingF),
+			string.format("downAge=%.3f", os.clock() - lastDownStamp))
 		if pendingDownEcho > 0 and os.clock() - lastDownStamp < ECHO_WINDOW then
 			pendingDownEcho = pendingDownEcho - 1
 			counterDiag("F_DOWN_ECHO", "pendingDown=" .. tostring(pendingDownEcho),
@@ -521,6 +525,10 @@ table.insert(connections, UserInputService.InputBegan:Connect(function(input, _g
 end))
 table.insert(connections, UserInputService.InputEnded:Connect(function(input)
 	if input.KeyCode == Enum.KeyCode.F and input.UserInputType == Enum.UserInputType.Keyboard then
+		counterDiag("F_END_EV", "pD=" .. tostring(pendingDownEcho),
+			"pU=" .. tostring(pendingUpEcho),
+			"hold=" .. tostring(userHoldingF),
+			string.format("upAge=%.3f", os.clock() - lastUpStamp))
 		if pendingUpEcho > 0 and os.clock() - lastUpStamp < ECHO_WINDOW then
 			pendingUpEcho = pendingUpEcho - 1
 			counterDiag("F_UP_ECHO", "pendingUp=" .. tostring(pendingUpEcho),
@@ -1744,6 +1752,13 @@ local recentM1Time = os.clock()
 -- Fly / HeadAttach state (lives here, not top-level: the main chunk is at
 -- the 200-register limit). All users are below in this IIFE.
 local flySwingTime = 0 -- last own-M1-swing timestamp (fly slows while fresh)
+-- Expected end of our own M1 animation (from the track length). While a swing is
+-- still playing the game swallows F edges, so every synthetic edge we send in
+-- that window is both futile AND a mask window: if the user's real release lands
+-- inside it, the engine sees no transition, userHoldingF stays stale-true, and
+-- the next repress leaves the block stuck ON with the finger up. The re-arm
+-- watchdog waits for this timestamp before touching F.
+local ownSwingEndsAt = 0
 -- HeadAttach state + tuning (bundled to keep the wrapped chunk under the register limit)
 local hattState = {
 	enabled = false, -- was headAttachEnabled
@@ -6698,6 +6713,9 @@ local function hookFlySwing(char)
 		local num = aid and (tostring(aid):match("%d+")) or ""
 		if num ~= "" and sharedM1AnimIds[num] then
 			flySwingTime = os.clock()
+			local len = 0.4
+			pcall(function() len = track.Length end)
+			ownSwingEndsAt = os.clock() + math.clamp(len, 0.2, 1.0)
 		end
 	end)
 	table.insert(connections, flySwingConn)
@@ -7083,6 +7101,42 @@ local function isAirSwingHolding()
 	return false
 end
 
+-- Hit/stun trace: a stun interrupts block edges, and a counter or arm that was
+-- live when the hit landed is the other reported way the guard never returns.
+-- Log the arm/transition state at each health drop (and on the stun-ish humanoid
+-- states) so a capture of "got hit before the arm went off" shows which path
+-- was live at that instant.
+local function hookHitTrace(char)
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not hum then return end
+	local lastHit = 0
+	table.insert(connections, hum.HealthChanged:Connect(function(hp)
+		local now = os.clock()
+		if now - lastHit < 0.15 then return end
+		lastHit = now
+		counterDiag("HIT", string.format("hp=%.1f", hp),
+			"armed=" .. tostring(airSwingArmed ~= nil),
+			"transitioning=" .. tostring(transitioningToCounter),
+			"blockingState=" .. tostring(blockingState),
+			"userHoldingF=" .. tostring(userHoldingF),
+			counterDiagBlocking())
+	end))
+	table.insert(connections, hum.StateChanged:Connect(function(_, new)
+		local stun = new == Enum.HumanoidStateType.Ragdoll
+			or new == Enum.HumanoidStateType.GettingUp
+			or new == Enum.HumanoidStateType.FallingDown
+			or new == Enum.HumanoidStateType.Physics
+			or new == Enum.HumanoidStateType.Dead
+		if not (stun or transitioningToCounter or airSwingArmed) then return end
+		counterDiagThrottled("humState", 0.4, "HUM_STATE", tostring(new),
+			"armed=" .. tostring(airSwingArmed ~= nil),
+			"transitioning=" .. tostring(transitioningToCounter),
+			"blockingState=" .. tostring(blockingState))
+	end))
+end
+if LocalPlayer.Character then hookHitTrace(LocalPlayer.Character) end
+table.insert(connections, LocalPlayer.CharacterAdded:Connect(hookHitTrace))
+
 local function findAirSwingTarget(localHrp)
 	for _, player in ipairs(Players:GetPlayers()) do
 		if player ~= LocalPlayer and player.Name ~= LocalPlayer.Name and player.Character then
@@ -7307,7 +7361,7 @@ local function airSwingFire()
 				"hadScriptHold=" .. tostring(hadScriptHold),
 				"autoBlockEnabled=" .. tostring(autoBlockEnabled))
 		end
-		scheduleBlockReArm(myGen, counterTransitionStart + 2.0)
+		scheduleBlockReArm(counterTransitionStart + 2.0)
 	end)
 end
 
@@ -7514,7 +7568,7 @@ local function setupGlobalCounterListener()
 					"wasUserHolding=" .. tostring(wasUserHolding),
 					"userHoldingF=" .. tostring(userHoldingF))
 			end
-			scheduleBlockReArm(myGen, counterTransitionStart + 2.0)
+			scheduleBlockReArm(counterTransitionStart + 2.0)
 		end)
 	end
 
@@ -7554,6 +7608,22 @@ end
 table.insert(connections, LocalPlayer.CharacterAdded:Connect(function()
 	task.wait(0.5)
 	setupGlobalCounterListener()
+end))
+
+-- Respawn reset: the old character's block/transition state dies with it. Without
+-- this, a hit/death mid-arm carries a stale finger tracker and a live transition
+-- into the new life, so the guard can never clear or never return. Invalidate any
+-- in-flight counter (generation bump) and re-derive the finger from the real key.
+table.insert(connections, LocalPlayer.CharacterAdded:Connect(function()
+	counterGen = counterGen + 1
+	blockGen = blockGen + 1
+	transitioningToCounter = false
+	transitionOwnerGen = 0
+	blockingState = false
+	airSwingArmed = nil
+	pcall(function() userHoldingF = UserInputService:IsKeyDown(Enum.KeyCode.F) end)
+	counterDiag("RESPAWN_RESET", "counterGen=" .. tostring(counterGen),
+		"userHoldingF=" .. tostring(userHoldingF))
 end))
 
 -- Diagnostic watchdog: catches the "transitioningToCounter got latched" failure.
@@ -8498,39 +8568,102 @@ end
 -- (no up->down transition = no event). Their rapid release+repress afterwards
 -- then does nothing and the block stays dead. This watchdog keeps re-edging F
 -- with a clean up->down pair while "F held but not blocking" holds, until the
--- block finally comes out or the deadline passes. It watches the engine state
--- too (IsKeyDown), so a desynced userHoldingF cannot hide the stuck signature.
--- Bounded: ~2s deadline from the counter, at most 4 re-edges per watchdog.
-scheduleBlockReArm = function(myGen, deadline)
-	task.spawn(function()
-		local reEdges = 0
-		while os.clock() < deadline do
+-- block finally comes out or the deadline passes. It never re-edges while our
+-- own M1 animation is still playing (the game swallows edges mid-swing, and the
+-- up-window would eat a real release), and it only acts while the finger
+-- tracker still says the user wants the guard -- the engine key state cannot be
+-- trusted for that, because our own synthetic press is what holds it down.
+--
+-- ONE shared watchdog for the whole script, not one per counter: a live capture
+-- showed five rapid counters stacking five watchdogs that chattered synthetic F
+-- edges every ~30-100ms (20+ interleaved up/down pairs in two seconds) -- and a
+-- synthetic edge landing inside the user's release/re-tap window is what eats
+-- the real press. The shared budget keeps the re-edge cadence slow and lets a
+-- fresh schedule extend the same window instead of adding more chatter.
+local blockReArmDeadline = 0
+local blockReArmReEdges = 0
+local blockReArmExtensions = 0
+local blockReArmThread = nil
+scheduleBlockReArm = function(deadline)
+	if os.clock() > blockReArmDeadline then
+		blockReArmReEdges = 0 -- previous window expired: fresh budget
+		blockReArmExtensions = 0
+	end
+	if deadline > blockReArmDeadline then
+		blockReArmDeadline = deadline
+	end
+	if blockReArmThread then return end
+	blockReArmThread = task.spawn(function()
+		while true do
 			task.wait(0.3)
 			local char = LocalPlayer.Character
-			if not char then return end
-			local holding = false
-			pcall(function()
-				holding = userHoldingF or UserInputService:IsKeyDown(Enum.KeyCode.F)
-			end)
-			if not holding then continue end -- nobody wants block right now
-			if transitioningToCounter then continue end -- a sequence owns F
+			if not char then break end
+			local fingerHeld = false
+			pcall(function() fingerHeld = userHoldingF end)
+			local wantGuard = fingerHeld or autoBlockEnabled
 			local blockingNow = false
 			pcall(function() blockingNow = isTriggerBlocking(char) end)
+			if os.clock() > blockReArmDeadline then
+				-- A stun/hit can outlast the window while the finger is still down
+				-- and the guard still missing. Giving up here is exactly what left
+				-- the block dead in earlier captures, so extend in 1s steps (bounded)
+				-- while the signature is still live.
+				if wantGuard and not blockingNow and blockReArmExtensions < 4 then
+					blockReArmExtensions = blockReArmExtensions + 1
+					blockReArmDeadline = os.clock() + 1.0
+					counterDiag("REARM_EXTEND", "n=" .. tostring(blockReArmExtensions),
+						"transitioning=" .. tostring(transitioningToCounter))
+				else
+					break
+				end
+			end
+			if not wantGuard then
+				-- Do NOT fall back to IsKeyDown here: the engine F is down because
+				-- of our own synthetic press, so it says "held" even after the user
+				-- released. Trusting it re-blocks a released finger and leaves the
+				-- guard stuck ON. Log the mismatch so a stale-false tracker shows up.
+				counterDiagThrottled("rearmNoHold", 1.0, "REARM_SKIP", "reason=noFinger",
+					"keyDown=" .. tostring(UserInputService:IsKeyDown(Enum.KeyCode.F)))
+				continue
+			end
+			if transitioningToCounter then continue end -- a sequence owns F
 			if blockingNow then continue end -- block is up: nothing to do
-			if reEdges >= 4 then return end
-			reEdges = reEdges + 1
-			counterDiag("BLOCK_REARM", "src=counter", "gen=" .. tostring(myGen),
-				"reEdges=" .. tostring(reEdges),
-				string.format("deadlineIn=%.2f", deadline - os.clock()))
+			if os.clock() < ownSwingEndsAt then
+				-- Our own swing still owns the state: any edge now is swallowed by
+				-- the game and only opens a window that can eat a real user edge.
+				counterDiagThrottled("rearmSwingDefer", 0.5, "REARM_DEFER", "reason=ownSwing",
+					string.format("endsIn=%.2f", ownSwingEndsAt - os.clock()))
+				continue
+			end
+			blockReArmReEdges = blockReArmReEdges + 1
+			counterDiag("BLOCK_REARM", "src=counter",
+				"reEdges=" .. tostring(blockReArmReEdges),
+				string.format("deadlineIn=%.2f", blockReArmDeadline - os.clock()))
 			scriptFUp()
 			task.wait(0.03)
-			if transitioningToCounter then return end -- claimed mid-edge
+			if transitioningToCounter then break end -- claimed mid-edge
 			scriptFDown()
+			-- A re-edge that lands mid-swing is swallowed by the game and leaves
+			-- the engine F held down with no block -- exactly the stuck state. Log
+			-- it so a capture shows whether the retry actually took; the loop then
+			-- tries again on the next tick until the deadline.
+			task.wait(0.12)
+			if transitioningToCounter then break end
+			local took = false
+			pcall(function() took = isTriggerBlocking(char) end)
+			if not took then
+				counterDiag("REARM_SWALLOWED", "reEdges=" .. tostring(blockReArmReEdges),
+					"isKeyDownF=" .. tostring(UserInputService:IsKeyDown(Enum.KeyCode.F)))
+			end
 			if autoBlockEnabled then
 				blockingState = true
 				blockStartTime = os.clock()
 			end
 		end
+		blockReArmThread = nil
+		blockReArmDeadline = 0
+		blockReArmReEdges = 0
+		blockReArmExtensions = 0
 	end)
 end
 
@@ -8652,7 +8785,7 @@ local function resolveChannelUnblock(idx)
 	end
 	-- The skill animation can swallow the rebuffer's edge just like a swing can,
 	-- so hand off to the same post-fire re-arm watchdog the counters use.
-	scheduleBlockReArm(ownerGen, os.clock() + 2.0)
+	scheduleBlockReArm(os.clock() + 2.0)
 	task.spawn(function()
 		task.wait(0.08)
 		-- A newer sequence may have claimed F during the beat: let it own the
