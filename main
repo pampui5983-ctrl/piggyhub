@@ -68,6 +68,9 @@ local tbState = {
 	markChar = nil, -- was triggerbotMarkChar
 	wasBlocking = false, -- was triggerbotWasBlocking
 	unblockOnUse = false, -- drop our guard before firing when the target drops theirs
+	unblock = { false, false }, -- per channel: guard dropped for the active request
+	unblockGen = { 0, 0 }, -- transitionOwnerGen snapshot owning that drop
+	unblockScriptHold = { false, false }, -- script hold the drop killed
 	lastFire = 0, -- was lastTriggerFire
 	lastFire2 = 0, -- was lastTriggerFire2
 	refire = 0.2, -- was triggerRefire; repeated-attempt cadence while the target is not blocking
@@ -8503,7 +8506,6 @@ scheduleBlockReArm = function(myGen, deadline)
 		local reEdges = 0
 		while os.clock() < deadline do
 			task.wait(0.3)
-			if myGen ~= counterGen then return end -- a newer sequence owns F
 			local char = LocalPlayer.Character
 			if not char then return end
 			local holding = false
@@ -8522,7 +8524,7 @@ scheduleBlockReArm = function(myGen, deadline)
 				string.format("deadlineIn=%.2f", deadline - os.clock()))
 			scriptFUp()
 			task.wait(0.03)
-			if myGen ~= counterGen then return end -- superseded mid-edge
+			if transitioningToCounter then return end -- claimed mid-edge
 			scriptFDown()
 			if autoBlockEnabled then
 				blockingState = true
@@ -8600,11 +8602,84 @@ local function isOwnSlotOnCooldown(slot)
 	return num ~= nil and num < 19.5
 end
 
+-- Cast detection across ALL backpack configurations: a press counts as landed
+-- when any config transitions ready -> cooling shortly after we pressed. The
+-- per-slot mapping above can miss (HUD/backpack naming differences), and a move
+-- whose COOLDOWN attribute lives on a different config would otherwise never
+-- confirm -- which is what made requests look "unconfirmable".
+local castStartTimes = {}
+local function pollCastStarts()
+	local bp = LocalPlayer:FindFirstChild("Backpack")
+	if not bp then return end
+	for _, config in ipairs(bp:GetChildren()) do
+		if config:IsA("Configuration") then
+			local ok, v = pcall(function() return config:GetAttribute("COOLDOWN") end)
+			local num = ok and tonumber(v) or nil
+			if num ~= nil and num < 19.5 then
+				if castStartTimes[config] == nil then
+					castStartTimes[config] = os.clock()
+				end
+			else
+				castStartTimes[config] = nil
+			end
+		end
+	end
+end
+local function anyRecentCast(now)
+	for _, t in pairs(castStartTimes) do
+		if now - t < 0.6 then return true end
+	end
+	return false
+end
+
+-- Restores the guard a channel's "Unblock on use" drop removed, once that
+-- shot resolves: release the transition latch (only if this drop owns it)
+-- and re-press F for a finger that never left, or for a script hold the drop
+-- killed. Runs once per shot instead of per retry -- re-blocking between
+-- fire attempts is what made the guard stutter and wedge. Spawned with a short
+-- beat so the move press always lands before the guard returns.
+local function resolveChannelUnblock(idx)
+	if not tbState.unblock[idx] then return end
+	tbState.unblock[idx] = false
+	local ownerGen = tbState.unblockGen[idx]
+	local hadScriptHold = tbState.unblockScriptHold[idx]
+	tbState.unblockGen[idx] = 0
+	tbState.unblockScriptHold[idx] = false
+	if transitionOwnerGen == ownerGen then
+		transitioningToCounter = false
+		counterDiag("TRANSITION_CLEAR", "src=triggerbot", "reason=requestResolved",
+			"slot=" .. tostring((idx == 2) and tbState.slot2 or tbState.slot))
+	end
+	-- The skill animation can swallow the rebuffer's edge just like a swing can,
+	-- so hand off to the same post-fire re-arm watchdog the counters use.
+	scheduleBlockReArm(ownerGen, os.clock() + 2.0)
+	task.spawn(function()
+		task.wait(0.08)
+		-- A newer sequence may have claimed F during the beat: let it own the
+		-- guard instead of re-pressing over its unblock.
+		if transitioningToCounter and transitionOwnerGen ~= ownerGen then return end
+		if userHoldingF then
+			scriptFDown()
+			if autoBlockEnabled then
+				blockingState = true
+				blockStartTime = os.clock()
+			end
+			counterDiag("TRIGGER_REBLOCK", "src=triggerbot", "reason=fingerStillDown")
+		elseif hadScriptHold and autoBlockEnabled then
+			scriptFDown()
+			blockingState = true
+			blockStartTime = os.clock()
+			counterDiag("TRIGGER_REBLOCK", "src=triggerbot", "reason=hadScriptHold")
+		end
+	end)
+end
+
 -- Clears a channel's fire request after it resolves. The master toggle stays on:
 -- each keypress is one firing attempt, confirmed by the slot's cooldown. When
 -- no requests remain the shared lock (and arrow) drops with them, so nothing
 -- lingers while the toggle just sits on.
 tbState.clearRequest = function(idx, msg, silent)
+	resolveChannelUnblock(idx)
 	if idx == 2 then
 		tbState.pending2 = false
 		tbState.awaitingCd2 = false
@@ -8645,8 +8720,16 @@ local function evalTriggerChannel(idx, now, markChanged, justUnblocked)
 		return
 	end
 	if (idx == 2) and tbState.awaitingCd2 or (idx ~= 2) and tbState.awaitingCd then
-		if isOwnSlotOnCooldown(slot) then
+		if isOwnSlotOnCooldown(slot) or anyRecentCast(now) then
+			-- Press landed: one clean shot per keypress -- clear the request
+			-- (the mark/arrow drop with it) and put the guard back.
+			if idx == 2 then
+				tbState.awaitingCd2 = false
+			else
+				tbState.awaitingCd = false
+			end
 			tbState.clearRequest(idx)
+			counterDiag("TRIGGER_CONFIRMED", "src=triggerbot", "slot=" .. tostring(slot))
 		else
 			local pressTime = (idx == 2) and tbState.pressTime2 or tbState.pressTime
 			if now - pressTime > tbState.cdTimeout then
@@ -8654,13 +8737,19 @@ local function evalTriggerChannel(idx, now, markChanged, justUnblocked)
 					tbState.awaitingCd2 = false
 					tbState.unconfirmed2 = tbState.unconfirmed2 + 1
 					if tbState.unconfirmed2 >= tbState.maxUnconfirmed then
-						tbState.clearRequest(idx, "Triggerbot gave up (no cooldown detected)")
+						-- Unconfirmable move: the cast still happened (the move
+						-- fires), so finish the shot the same clean way.
+						tbState.unconfirmed2 = 0
+						tbState.clearRequest(idx)
+						counterDiag("TRIGGER_RETRY_RESET", "src=triggerbot", "slot=" .. tostring(slot))
 					end
 				else
 					tbState.awaitingCd = false
 					tbState.unconfirmed = tbState.unconfirmed + 1
 					if tbState.unconfirmed >= tbState.maxUnconfirmed then
-						tbState.clearRequest(idx, "Triggerbot gave up (no cooldown detected)")
+						tbState.unconfirmed = 0
+						tbState.clearRequest(idx)
+						counterDiag("TRIGGER_RETRY_RESET", "src=triggerbot", "slot=" .. tostring(slot))
 					end
 				end
 			end
@@ -8669,8 +8758,8 @@ local function evalTriggerChannel(idx, now, markChanged, justUnblocked)
 	end
 	local lastFire = (idx == 2) and tbState.lastFire2 or tbState.lastFire
 	if markChanged or justUnblocked or (now - lastFire > tbState.refire) then
-		if isOwnSlotOnCooldown(slot) then
-			-- Own move still cooling: hold (stay armed) until it is ready
+		if isOwnSlotOnCooldown(slot) or anyRecentCast(now) then
+			-- Own move still cooling (or a cast just started): hold (stay armed)
 			return
 		end
 		-- Arm the fire IMMEDIATELY (lastFire + awaitingCd) so frames that run
@@ -8688,81 +8777,44 @@ local function evalTriggerChannel(idx, now, markChanged, justUnblocked)
 			end
 		end
 		-- "Unblock on use": our own guard makes the server eat skill presses,
-		-- so drop it first, give the drop a beat to register, then fire. The
-		-- sequence claims the SAME counter-transition latch the airswing/impact
-		-- counters use: checkShouldBlock, parry taps, the 1s stuck-clear and
-		-- other counters all sit behind that gate, so nothing re-presses or
-		-- releases F underneath us mid-sequence. Without it the 0.2s retry cycle
-		-- and the autoblock machinery fight over F every frame -- the same
-		-- interleaved-event desync that caused the old stuck block.
-		local wasUserHolding = false
-		local hadScriptHold = false
-		local mySeq = 0
+		-- so drop it before firing. The drop happens ONCE per shot -- the
+		-- request holds the same counter-transition latch the airswing/impact
+		-- counters use while the shot runs, so checkShouldBlock, parry taps and
+		-- the stuck-clear stay out of the way. The guard is restored when the
+		-- shot resolves (cast detected, retry budget spent, or the target
+		-- re-blocks -- all via resolveChannelUnblock).
 		if tbState.unblockOnUse and isAirSwingHolding() and not transitioningToCounter then
-			wasUserHolding = userHoldingF
-			hadScriptHold = blockingState
 			counterGen = counterGen + 1 -- newest sequence owns the latch
-			mySeq = counterGen
+			local mySeq = counterGen
 			transitionOwnerGen = mySeq
 			transitioningToCounter = true
 			counterTransitionStart = os.clock()
 			counterTransitionWarned = false
 			blockGen = blockGen + 1 -- kill in-flight parry taps so they cannot re-press or release over us
+			tbState.unblockScriptHold[idx] = blockingState
 			blockingState = false
 			scriptFUp()
+			tbState.unblock[idx] = true
+			tbState.unblockGen[idx] = mySeq
 			counterDiag("TRIGGER_UNBLOCK", "src=triggerbot", "slot=" .. tostring(slot),
 				"gen=" .. tostring(mySeq),
-				"wasUserHolding=" .. tostring(wasUserHolding),
-				"hadScriptHold=" .. tostring(hadScriptHold))
+				"wasUserHolding=" .. tostring(userHoldingF),
+				"hadScriptHold=" .. tostring(tbState.unblockScriptHold[idx]))
 			task.wait(0.06)
+			-- A cancel/resolve during the beat must not fire a stray press.
+			if not ((idx == 2) and tbState.pending2 or (idx ~= 2) and tbState.pending1) then return end
 		end
 		fireSkillKey(slot)
 		if not hasCdConfig then
-			-- Slot has no trackable cooldown state: assume the press landed
+			-- Slot has no trackable cooldown state: assume the press landed and
+			-- resolve (restores the guard if this fire dropped it).
 			tbState.clearRequest(idx)
-		end
-		-- Restore the guard exactly like airSwingFire's REPRESS: a physical hold
-		-- that never left, or the script's own hold when autoblock owned the
-		-- block. The transition-aware scriptFDown skips if F is already down,
-		-- and a lifted finger simply stays unblocked (their next press
-		-- re-blocks). A real release mid-sequence bumps counterGen (F_UP_BUMP),
-		-- which aborts the restore below instead of re-pressing over the user.
-		if mySeq ~= 0 then
-			local seqOk, seqErr = pcall(function()
-				task.wait(0.08)
-				if mySeq ~= counterGen then return end
-				if wasUserHolding and userHoldingF then
-					scriptFDown()
-					if autoBlockEnabled then
-						blockingState = true
-						blockStartTime = os.clock()
-					end
-					counterDiag("TRIGGER_REBLOCK", "src=triggerbot", "slot=" .. tostring(slot),
-						"reason=fingerStillDown", "gen=" .. tostring(mySeq))
-				elseif hadScriptHold and autoBlockEnabled then
-					-- Resume the script's own hold (no finger involved).
-					scriptFDown()
-					blockingState = true
-					blockStartTime = os.clock()
-					counterDiag("TRIGGER_REBLOCK", "src=triggerbot", "slot=" .. tostring(slot),
-						"reason=hadScriptHold", "gen=" .. tostring(mySeq))
-				end
-			end)
-			if not seqOk then
-				counterDiag("TRIGGER_SEQ_ERROR", "src=triggerbot", tostring(seqErr))
-			end
-			-- Abort-safe latch release: only clear when we still own it, so a
-			-- newer counter can never have its latch stolen.
-			if transitionOwnerGen == mySeq then
-				transitioningToCounter = false
-				counterDiag("TRANSITION_CLEAR", "src=triggerbot", "gen=" .. tostring(mySeq),
-					string.format("heldFor=%.3f", os.clock() - counterTransitionStart))
-			end
 		end
 	end
 end
 
 	table.insert(connections, RunService.RenderStepped:Connect(function()
+	pollCastStarts()
 	if not tbState.enabled then
 		if triggerMarkGui then triggerMarkGui.Enabled = false end
 		tbState.markPlayer = nil
@@ -8773,6 +8825,27 @@ end
 		tbState.pending1 = false
 		tbState.pending2 = false
 		tbState.retarget = false
+		-- Drop any "Unblock on use" state with the request it belonged to, so a
+		-- transition latch never outlives the toggle; put the guard back if a
+		-- finger is still down (the drop was only ever for the fire).
+		if tbState.unblock[1] or tbState.unblock[2] then
+			if transitionOwnerGen == tbState.unblockGen[1] or transitionOwnerGen == tbState.unblockGen[2] then
+				transitioningToCounter = false
+			end
+			if userHoldingF then
+				scriptFDown()
+				if autoBlockEnabled then
+					blockingState = true
+					blockStartTime = os.clock()
+				end
+			end
+		end
+		tbState.unblock[1] = false
+		tbState.unblock[2] = false
+		tbState.unblockGen[1] = 0
+		tbState.unblockGen[2] = 0
+		tbState.unblockScriptHold[1] = false
+		tbState.unblockScriptHold[2] = false
 		return
 	end
 
@@ -8849,7 +8922,13 @@ end
 	local blocking = isTriggerBlocking(mchar)
 	local justUnblocked = tbState.wasBlocking and not blocking
 	tbState.wasBlocking = blocking
-	if blocking then return end
+	if blocking then
+		-- Target re-blocked mid-session: the guard drop only ever existed to
+		-- fire, so put it back; the session stays armed for the next opening.
+		if tbState.unblock[1] then resolveChannelUnblock(1) end
+		if tbState.unblock[2] then resolveChannelUnblock(2) end
+		return
+	end
 
 	-- On-screen gate: only fire while the locked target is actually on screen,
 	-- so it never goes off when they are behind you or off camera.
