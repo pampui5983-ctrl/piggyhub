@@ -133,6 +133,16 @@ local autoState = {
 
 
 local blockingState = false
+-- True while a left click is holding the guard down (click-to-attack). Declared
+-- up here so the counter/triggerbot restore paths can see it.
+local attackClickDrop = false
+-- Whether an Auto Block script hold was up when the click dropped the guard, so
+-- it can be resumed on release even with no finger on F.
+local attackDropHadScriptHold = false
+-- Mouse state + a short grace after release: tap-spam re-blocks the guard only
+-- once the clicks actually stop, so every tap gets an F-up at swing time.
+local attackDropMouseDown = false
+local attackDropGraceUntil = 0
 local testHoldBlock = false -- test utility: holds F until repressed
 local counterQueued = false
 local transitioningToCounter = false
@@ -7010,7 +7020,7 @@ local function doParryTap(track)
 			return
 		end
 		-- Ensure we are still in blockingState and haven't transitioned to counter during the wait
-		if blockingState and not transitioningToCounter then
+		if blockingState and not transitioningToCounter and not attackClickDrop then
 			scriptFDown()
 			counterDiag("PARRY_TAP_DOWN", "gen=" .. tostring(myGen),
 				"hold=" .. tostring(autoCounterEnabled and blockHoldForCounter or blockTapDuration))
@@ -7336,7 +7346,7 @@ local function airSwingFire()
 		counterDiag("TRANSITION_OFF", "src=airswing", "gen=" .. tostring(myGen),
 			string.format("heldFor=%.3f", os.clock() - transitionStarted))
 
-		if wasUserHolding and userHoldingF then
+		if wasUserHolding and userHoldingF and not attackClickDrop then
 			counterDiag("REPRESS", "src=airswing", "reason=fingerStillDown",
 				"autoBlockEnabled=" .. tostring(autoBlockEnabled),
 				"hadScriptHold=" .. tostring(hadScriptHold))
@@ -7347,7 +7357,7 @@ local function airSwingFire()
 			else
 				blockingState = false
 			end
-		elseif hadScriptHold and autoBlockEnabled then
+		elseif hadScriptHold and autoBlockEnabled and not attackClickDrop then
 			-- Resume script's own hold (no finger involved).
 			counterDiag("REPRESS", "src=airswing", "reason=hadScriptHold",
 				"releaseOwner=none", "autoBlockEnabled=true")
@@ -7556,7 +7566,7 @@ local function setupGlobalCounterListener()
 
 			-- Re-apply block after the counter only if the finger is still down,
 			-- so holding F the whole time keeps blocking after the counter M1.
-			if wasUserHolding and userHoldingF then
+			if wasUserHolding and userHoldingF and not attackClickDrop then
 				counterDiag("REPRESS", "src=impact", "reason=fingerStillDown",
 					"autoBlockEnabled=" .. tostring(autoBlockEnabled))
 				blockingState = true
@@ -7653,6 +7663,56 @@ table.insert(connections, RunService.Heartbeat:Connect(function()
 end))
 
 -- ====================== SYSTEM CONNECTIONS ======================
+
+-- Click-to-attack guard drop. ABA never lets a held left click block, so a click
+-- (or a held click) is an explicit "I am attacking" signal. With autocounter on,
+-- drop the guard for the click's duration no matter who raised it -- finger, parry
+-- tap, counter repress or triggerbot -- and put it back on release. This doubles
+-- as the escape hatch for a guard stuck up: clicking is what the user does when
+-- they notice they cannot attack, and now it works instead of being eaten.
+table.insert(connections, UserInputService.InputBegan:Connect(function(input, gp)
+	if gp then return end -- GUI click (toggle/button), not an attack
+	if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+	attackDropMouseDown = true
+	attackDropGraceUntil = 0 -- a fresh click cancels a pending restore
+	if not autoCounterEnabled or attackClickDrop then return end
+	if transitioningToCounter then return end -- a sequence owns F right now
+	if not (blockingState or UserInputService:IsKeyDown(Enum.KeyCode.F)) then return end
+	attackClickDrop = true
+	attackDropHadScriptHold = autoBlockEnabled and blockingState
+	blockingState = false
+	scriptFUp()
+	counterDiag("ATTACK_DROP", "src=click", "userHoldingF=" .. tostring(userHoldingF),
+		"hadScriptHold=" .. tostring(attackDropHadScriptHold), counterDiagBlocking())
+end))
+table.insert(connections, UserInputService.InputEnded:Connect(function(input)
+	if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+	attackDropMouseDown = false
+	if not attackClickDrop then return end
+	attackDropGraceUntil = os.clock() + 0.12
+	local hadScriptHold = attackDropHadScriptHold
+	task.delay(0.12, function()
+		if attackDropMouseDown then return end -- clicked again: stay dropped
+		if not attackClickDrop then return end
+		attackClickDrop = false
+		attackDropHadScriptHold = false
+		if transitioningToCounter then return end -- a sequence owns F right now
+		if tbState.unblock[1] or tbState.unblock[2] then return end -- triggerbot drop owns it
+		if userHoldingF then
+			scriptFDown()
+			if autoBlockEnabled then
+				blockingState = true
+				blockStartTime = os.clock()
+			end
+			counterDiag("ATTACK_REBLOCK", "src=click", "reason=fingerStillDown")
+		elseif hadScriptHold and autoBlockEnabled then
+			scriptFDown()
+			blockingState = true
+			blockStartTime = os.clock()
+			counterDiag("ATTACK_REBLOCK", "src=click", "reason=hadScriptHold")
+		end
+	end)
+end))
 
 -- Keybind Press to Toggle lock target
 table.insert(connections, UserInputService.InputBegan:Connect(function(input, gp)
@@ -8574,12 +8634,18 @@ end
 -- tracker still says the user wants the guard -- the engine key state cannot be
 -- trusted for that, because our own synthetic press is what holds it down.
 --
--- ONE shared watchdog for the whole script, not one per counter: a live capture
+-- One shared watchdog for the whole script, not one per counter: a live capture
 -- showed five rapid counters stacking five watchdogs that chattered synthetic F
 -- edges every ~30-100ms (20+ interleaved up/down pairs in two seconds) -- and a
 -- synthetic edge landing inside the user's release/re-tap window is what eats
 -- the real press. The shared budget keeps the re-edge cadence slow and lets a
 -- fresh schedule extend the same window instead of adding more chatter.
+--
+-- A re-edge also waits a beat PAST the end of our own swing: the uptilt's longer
+-- endlag means a "release right after the swing" lands at almost the same instant
+-- the watchdog wants to re-edge, and that up-window is what ate the release
+-- (stale tracker -> the guard comes back on a finger that is already up).
+local REARM_POST_SWING_DELAY = 0.2
 local blockReArmDeadline = 0
 local blockReArmReEdges = 0
 local blockReArmExtensions = 0
@@ -8603,6 +8669,22 @@ scheduleBlockReArm = function(deadline)
 			local wantGuard = fingerHeld or autoBlockEnabled
 			local blockingNow = false
 			pcall(function() blockingNow = isTriggerBlocking(char) end)
+			-- A held left click owns the guard down: ABA never lets you block while
+			-- attacking, so re-edging now would eat the user's swing. Only clear the
+			-- flag if the release/restore task was lost (mouse up, grace over).
+			if attackClickDrop then
+				local stale = false
+				if not attackDropMouseDown and os.clock() > attackDropGraceUntil then
+					local stillDown = false
+					pcall(function() stillDown = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) end)
+					stale = not stillDown
+				end
+				if not stale then
+					counterDiagThrottled("rearmClickDrop", 1.0, "REARM_SKIP", "reason=attackClick")
+					continue
+				end
+				attackClickDrop = false
+			end
 			if os.clock() > blockReArmDeadline then
 				-- A stun/hit can outlast the window while the finger is still down
 				-- and the guard still missing. Giving up here is exactly what left
@@ -8628,11 +8710,11 @@ scheduleBlockReArm = function(deadline)
 			end
 			if transitioningToCounter then continue end -- a sequence owns F
 			if blockingNow then continue end -- block is up: nothing to do
-			if os.clock() < ownSwingEndsAt then
+			if os.clock() < ownSwingEndsAt + REARM_POST_SWING_DELAY then
 				-- Our own swing still owns the state: any edge now is swallowed by
 				-- the game and only opens a window that can eat a real user edge.
 				counterDiagThrottled("rearmSwingDefer", 0.5, "REARM_DEFER", "reason=ownSwing",
-					string.format("endsIn=%.2f", ownSwingEndsAt - os.clock()))
+					string.format("endsIn=%.2f", ownSwingEndsAt + REARM_POST_SWING_DELAY - os.clock()))
 				continue
 			end
 			blockReArmReEdges = blockReArmReEdges + 1
@@ -8791,6 +8873,7 @@ local function resolveChannelUnblock(idx)
 		-- A newer sequence may have claimed F during the beat: let it own the
 		-- guard instead of re-pressing over its unblock.
 		if transitioningToCounter and transitionOwnerGen ~= ownerGen then return end
+		if attackClickDrop then return end -- a held click owns the guard down
 		if userHoldingF then
 			scriptFDown()
 			if autoBlockEnabled then
@@ -8938,6 +9021,33 @@ local function evalTriggerChannel(idx, now, markChanged, justUnblocked)
 			if not ((idx == 2) and tbState.pending2 or (idx ~= 2) and tbState.pending1) then return end
 		end
 		fireSkillKey(slot)
+		-- Put the guard back on a short fixed beat, independent of the shot's
+		-- cooldown confirmation. The skill press only needs the F-up at the press
+		-- instant; holding the guard down until the request resolves (which can
+		-- take several frames, or the whole retry budget) leaves a long window in
+		-- which a real release is invisible to the engine -- the tracker then
+		-- restores a guard the finger already left (stuck block after the move).
+		-- The transition latch and the request still resolve separately.
+		task.delay(0.15, function()
+			if not tbState.unblock[idx] then return end
+			if transitioningToCounter and transitionOwnerGen ~= tbState.unblockGen[idx] then return end
+			if attackClickDrop then return end -- a held click owns the guard down
+			if userHoldingF then
+				scriptFDown()
+				if autoBlockEnabled then
+					blockingState = true
+					blockStartTime = os.clock()
+				end
+				counterDiag("TRIGGER_REBLOCK", "src=triggerbot", "reason=earlyBeat",
+					"slot=" .. tostring(slot))
+			elseif tbState.unblockScriptHold[idx] and autoBlockEnabled then
+				scriptFDown()
+				blockingState = true
+				blockStartTime = os.clock()
+				counterDiag("TRIGGER_REBLOCK", "src=triggerbot", "reason=earlyBeatScriptHold",
+					"slot=" .. tostring(slot))
+			end
+		end)
 		if not hasCdConfig then
 			-- Slot has no trackable cooldown state: assume the press landed and
 			-- resolve (restores the guard if this fire dropped it).
@@ -8965,7 +9075,7 @@ end
 			if transitionOwnerGen == tbState.unblockGen[1] or transitionOwnerGen == tbState.unblockGen[2] then
 				transitioningToCounter = false
 			end
-			if userHoldingF then
+			if userHoldingF and not attackClickDrop then
 				scriptFDown()
 				if autoBlockEnabled then
 					blockingState = true
