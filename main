@@ -51,6 +51,10 @@ local ultEspEnabled = false
 local autoBlockEnabled = false
 local autoCounterEnabled = false
 local airSwingEnabled = false
+-- "M1 Overwrite": a left click (or held click) drops our guard for the duration
+-- of the click, whoever raised it. ABA never lets a held LMB block, so this is
+-- the same rule the game enforces, just applied to our synthetic guard too.
+local m1OverwriteEnabled = true
 -- Triggerbot state (bundled: keeps the main chunk under Luau's 200-local limit)
 local tbState = {
 	enabled = false, -- was triggerbotEnabled
@@ -210,6 +214,8 @@ local espState = {
 	targetEnabled = true, -- was targetEspEnabled
 	targetBillboard = nil, -- was targetEspBillboard
 	targetAlertTime = 0, -- was targetEspAlertTime
+	dashEnabled = false, -- Dash CD ESP toggle
+	dash = {}, -- [player] = billboard/fill refs + cooldown state
 }
 -- Player PiP (viewport spectator): all of its settings live in one table so the
 -- main chunk does not run out of local registers (Luau caps at 200).
@@ -987,7 +993,7 @@ tabFrames.esp.Position = UDim2.new(0, 140, 0, 10)
 tabFrames.esp.BackgroundTransparency = 1
 tabFrames.esp.Visible = false
 tabFrames.esp.Parent = bodyFrame
-tabFrames.esp.CanvasSize = UDim2.new(0, 0, 0, 560)
+tabFrames.esp.CanvasSize = UDim2.new(0, 0, 0, 600)
 tabFrames.esp.ScrollBarThickness = 6
 tabFrames.esp.ScrollBarImageColor3 = Color3.fromRGB(80, 80, 95)
 tabFrames.esp.ScrollingDirection = Enum.ScrollingDirection.Y
@@ -1000,7 +1006,7 @@ tabFrames.misc.Position = UDim2.new(0, 140, 0, 10)
 tabFrames.misc.BackgroundTransparency = 1
 tabFrames.misc.Visible = false
 tabFrames.misc.Parent = bodyFrame
-tabFrames.misc.CanvasSize = UDim2.new(0, 0, 0, 1450)
+tabFrames.misc.CanvasSize = UDim2.new(0, 0, 0, 1480)
 tabFrames.misc.ScrollBarThickness = 6
 tabFrames.misc.ScrollBarImageColor3 = Color3.fromRGB(80, 80, 95)
 tabFrames.misc.ScrollingDirection = Enum.ScrollingDirection.Y
@@ -1861,6 +1867,7 @@ function ConfigManager.collectSettings()
 		hpChainEnabled = chainState.hpEnabled,
 		sgChainEnabled = chainState.sgEnabled,
 		moveEspEnabled = espState.moveEnabled,
+		dashCdEspEnabled = espState.dashEnabled,
 		ultEspEnabled = ultEspEnabled,
 		arrowsEnabled = arrowsEnabled,
 		moveInputsEnabled = espState.inputsEnabled,
@@ -1871,6 +1878,7 @@ function ConfigManager.collectSettings()
 		autoCounterEnabled = autoCounterEnabled,
 		counterKey = (counterKey and counterKey.Name) or "None",
 		airSwingEnabled = airSwingEnabled,
+		m1OverwriteEnabled = m1OverwriteEnabled,
 		swingRange = swingRange,
 		airSwingDelay = airSwingDelay,
 		triggerbotEnabled = tbState.enabled,
@@ -1971,6 +1979,7 @@ function ConfigManager.load(name)
 	chainState.hpEnabled = data.hpChainEnabled or false
 	chainState.sgEnabled = data.sgChainEnabled or false
 	espState.moveEnabled = data.moveEspEnabled or false
+	espState.dashEnabled = data.dashCdEspEnabled or false
 	ultEspEnabled = data.ultEspEnabled or false
 			arrowsEnabled = data.arrowsEnabled or false
 			espState.inputsEnabled = data.moveInputsEnabled or false
@@ -1981,6 +1990,7 @@ function ConfigManager.load(name)
 	autoCounterEnabled = data.autoCounterEnabled or false
 	airSwingEnabled = data.airSwingEnabled or false
 	if not airSwingEnabled then _G.airSwingTrack = nil end
+	if data.m1OverwriteEnabled ~= nil then m1OverwriteEnabled = data.m1OverwriteEnabled == true end
 	swingRange = data.swingRange or 18
 	airSwingDelay = data.airSwingDelay or 0.40
 	tbState.enabled = data.triggerbotEnabled or data.triggerbot2Enabled or false
@@ -2065,6 +2075,7 @@ function ConfigManager.load(name)
 	if settingsRefs.hpChainEnabled then settingsRefs.hpChainEnabled.Set(chainState.hpEnabled) end
 	if settingsRefs.sgChainEnabled then settingsRefs.sgChainEnabled.Set(chainState.sgEnabled) end
 	if settingsRefs.moveEspEnabled then settingsRefs.moveEspEnabled.Set(espState.moveEnabled) end
+	if settingsRefs.dashCdEspEnabled then settingsRefs.dashCdEspEnabled.Set(espState.dashEnabled) end
 	if settingsRefs.ultEspEnabled then settingsRefs.ultEspEnabled.Set(ultEspEnabled) end
 			if settingsRefs.arrowsEnabled then settingsRefs.arrowsEnabled.Set(arrowsEnabled) end
 			if settingsRefs.moveInputsEnabled then settingsRefs.moveInputsEnabled.Set(espState.inputsEnabled) end
@@ -2076,6 +2087,7 @@ function ConfigManager.load(name)
  	if settingsRefs.airSwingDelay then settingsRefs.airSwingDelay.Set(airSwingDelay) end
 	if settingsRefs.autoCounterEnabled then settingsRefs.autoCounterEnabled.Set(autoCounterEnabled) end
 	if settingsRefs.airSwing then settingsRefs.airSwing.Set(airSwingEnabled) end
+	if settingsRefs.m1Overwrite then settingsRefs.m1Overwrite.Set(m1OverwriteEnabled) end
 	if settingsRefs.triggerbotEnabled then settingsRefs.triggerbotEnabled.Set(tbState.enabled) end
 	if settingsRefs.triggerbotKey then settingsRefs.triggerbotKey.Set(tbState.key) end
 	if settingsRefs.triggerbotSlot then settingsRefs.triggerbotSlot.Set(tbState.slot) end
@@ -3020,6 +3032,141 @@ task.spawn(function()
 end))
 end)
 
+-- ====================== DASH CD ESP ======================
+-- ABA's dash (Q) plays no animation, sets no attribute and fires no remote --
+-- it is a ~0.35s speed burst that pins at the 50 studs/s cap, so the only
+-- signal that reaches us (for ourselves and for other players) is velocity.
+-- Measured live against the real game by driving Q at a 60ms cadence and
+-- watching the burst rising edges: dash-to-dash gate = 1.33s (8 samples,
+-- 1.334-1.382s spread; the residual is the press cadence, not the game).
+-- The stickman therefore refills over 1.33s from the burst start: red the
+-- instant the burst begins, fully green when the dash is usable again.
+local DASH_CD_SECONDS = 1.33
+-- A dash is a SHORT horizontal burst peaking near the 50 cap. Skills that also
+-- move the player are either sustained (flight/charge, up to 300) or higher
+-- launches, and a straight-up jump is ~0 horizontal. So we open a candidate
+-- burst above DASH_OPEN, close it (hysteresis) below DASH_CLOSE, and accept it
+-- as a dash only if its duration and peak fall in the dash window. This rejects
+-- jumps, standing->run, sustained flight and big skill launches.
+local DASH_OPEN = 47 -- horizontal speed that opens a candidate burst
+local DASH_CLOSE = 45 -- burst closes below this (gap rejects run-speed hover)
+local DASH_MIN_DUR = 0.10
+local DASH_MAX_DUR = 0.60
+local DASH_MAX_PEAK = 90
+local DASH_GREEN = Color3.fromRGB(50, 220, 60)
+local DASH_RED = Color3.fromRGB(225, 50, 45)
+
+-- Draws a solid rounded fill bar that covers its entire parent container.
+-- Called twice per billboard: once for the red base, once for the green fill.
+local function buildDashBar(parent, color)
+	local fill = Instance.new("Frame")
+	fill.Size = UDim2.new(1, 0, 1, 0)
+	fill.BackgroundColor3 = color
+	fill.BorderSizePixel = 0
+	fill.Parent = parent
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0.25, 0)
+	c.Parent = fill
+end
+
+-- Bottom-up green fill for the vertical bar: the clip frame grows upward from
+-- the bottom edge, and the inner bar is stretched so its full height maps to
+-- the full container height (green colour is always flush with the bottom).
+local function setDashFill(entry, frac)
+	frac = math.clamp(frac, 0, 1)
+	local span = math.max(frac, 0.02)
+	entry.clip.Size = UDim2.new(1, 0, frac, 0)
+	entry.clip.Position = UDim2.new(0, 0, 1 - frac, 0)
+	entry.inner.Size = UDim2.new(1, 0, 1 / span, 0)
+	entry.inner.Position = UDim2.new(0, 0, -(1 - frac) / span, 0)
+end
+
+local DASH_BAR_SEGMENTS = 5 -- number of visual segments in the cooldown bar
+
+local function createDashBillboard(player, character)
+	if player == LocalPlayer then return end
+	if not espState.dashEnabled then return end
+	if not character then return end
+	local head = character:FindFirstChild("Head") or character:FindFirstChild("HumanoidRootPart")
+	if not head then return end
+	local existing = parentGui:FindFirstChild(player.Name .. "_DashBillboard")
+	if existing then existing:Destroy() end
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = player.Name .. "_DashBillboard"
+	billboard.Size = UDim2.new(0.38, 0, 2.2, 0) -- narrow vertical bar, slightly shorter than the old stickman
+	billboard.StudsOffset = Vector3.new(-1.6, 0, 0) -- left of the target, same general area
+	billboard.AlwaysOnTop = true
+	billboard.Adornee = head
+	billboard.Parent = parentGui
+
+	local rootFrame = Instance.new("Frame")
+	rootFrame.Name = "Root"
+	rootFrame.Size = UDim2.new(1, 0, 1, 0)
+	rootFrame.BackgroundTransparency = 1
+	rootFrame.Parent = billboard
+
+	-- Dark background so the empty portion of the bar reads as "unfilled"
+	local bg = Instance.new("Frame")
+	bg.Size = UDim2.new(1, 0, 1, 0)
+	bg.BackgroundColor3 = Color3.fromRGB(38, 38, 42)
+	bg.BorderSizePixel = 0
+	bg.Parent = rootFrame
+	do
+		local bgc = Instance.new("UICorner")
+		bgc.CornerRadius = UDim.new(0.25, 0)
+		bgc.Parent = bg
+		local bgs = Instance.new("UIStroke")
+		bgs.Color = Color3.fromRGB(15, 15, 18)
+		bgs.Thickness = 1.5
+		bgs.Parent = bg
+	end
+
+	-- Red base layer (shows as full red during cooldown, hidden under green when ready)
+	local redLayer = Instance.new("Frame")
+	redLayer.Name = "Red"
+	redLayer.Size = UDim2.new(1, 0, 1, 0)
+	redLayer.BackgroundTransparency = 1
+	redLayer.Parent = rootFrame
+	buildDashBar(redLayer, DASH_RED)
+
+	-- Green clip layer (grows left-to-right as cooldown expires)
+	local clip = Instance.new("Frame")
+	clip.Name = "Fill"
+	clip.Size = UDim2.new(1, 0, 1, 0)
+	clip.BackgroundTransparency = 1
+	clip.ClipsDescendants = true
+	clip.Parent = rootFrame
+	local inner = Instance.new("Frame")
+	inner.Name = "Inner"
+	inner.Size = UDim2.new(1, 0, 1, 0)
+	inner.BackgroundTransparency = 1
+	inner.Parent = clip
+	buildDashBar(inner, DASH_GREEN)
+
+	-- Horizontal segment dividers drawn on top of both colour layers
+	for i = 1, DASH_BAR_SEGMENTS - 1 do
+		local div = Instance.new("Frame")
+		div.Size = UDim2.new(1, 0, 0, 2)
+		div.Position = UDim2.new(0, 0, i / DASH_BAR_SEGMENTS, 0)
+		div.AnchorPoint = Vector2.new(0, 0.5)
+		div.BackgroundColor3 = Color3.fromRGB(15, 15, 18)
+		div.BorderSizePixel = 0
+		div.Parent = rootFrame
+	end
+
+	espState.dash[player] = {
+		billboard = billboard,
+		clip = clip,
+		inner = inner,
+		char = character,
+		readyAt = 0,
+		dashStart = 0,
+		burstStart = nil,
+		burstPeak = 0,
+	}
+	setDashFill(espState.dash[player], 1)
+end
+
 -- ESP TAB (Move ESP, Ult ESP, Offscreen arrows, Move inputs)
 settingsRefs.moveEspEnabled = createToggle(tabFrames.esp, "Move ESP", 10, espState.moveEnabled, function(state)
     espState.moveEnabled = state
@@ -3065,15 +3212,34 @@ settingsRefs.targetEspEnabled = createToggle(tabFrames.esp, "Target ESP", 170, e
     end
 end)
 
-settingsRefs.targetEspSensitivity = createSlider(tabFrames.esp, "Target ESP Sensitivity", 210, 0.05, 0.8, targetEspSensitivity, function(val)
+-- Dash CD ESP: a stickman left of every other player that is red for the whole
+-- dash cooldown and refills green bottom-up, so full green = dash available.
+settingsRefs.dashCdEspEnabled = createToggle(tabFrames.esp, "Dash CD ESP", 210, espState.dashEnabled, function(state)
+	espState.dashEnabled = state
+	if state then
+		for _, player in ipairs(Players:GetPlayers()) do
+			if player ~= LocalPlayer and player.Character then
+				task.spawn(createDashBillboard, player, player.Character)
+			end
+		end
+	else
+		for player in pairs(espState.dash) do
+			local dbb = parentGui:FindFirstChild(player.Name .. "_DashBillboard")
+			if dbb then dbb:Destroy() end
+		end
+		espState.dash = {}
+	end
+end)
+
+settingsRefs.targetEspSensitivity = createSlider(tabFrames.esp, "Target ESP Sensitivity", 258, 0.05, 0.8, targetEspSensitivity, function(val)
     targetEspSensitivity = val
 end)
 
-settingsRefs.targetEspRange = createSlider(tabFrames.esp, "Target ESP Range", 254, 50, 300, targetEspRange, function(val)
+settingsRefs.targetEspRange = createSlider(tabFrames.esp, "Target ESP Range", 302, 50, 300, targetEspRange, function(val)
     targetEspRange = val
 end)
 
-settingsRefs.ultEspSize = createSlider(tabFrames.esp, "Ult ESP Size", 298, 3.0, 9.0, espState.ultSize, function(val)
+settingsRefs.ultEspSize = createSlider(tabFrames.esp, "Ult ESP Size", 346, 3.0, 9.0, espState.ultSize, function(val)
 	espState.ultSize = val
 	for _, player in ipairs(Players:GetPlayers()) do
 		local bb = parentGui:FindFirstChild(player.Name .. "_ChargeBillboard")
@@ -3084,7 +3250,7 @@ settingsRefs.ultEspSize = createSlider(tabFrames.esp, "Ult ESP Size", 298, 3.0, 
 	end
 end)
 
-settingsRefs.moveEspSize = createSlider(tabFrames.esp, "Move ESP Size", 342, 1.0, 6.0, espState.moveSize, function(val)
+settingsRefs.moveEspSize = createSlider(tabFrames.esp, "Move ESP Size", 390, 1.0, 6.0, espState.moveSize, function(val)
 	espState.moveSize = val
 	for _, player in ipairs(Players:GetPlayers()) do
 		local bb = parentGui:FindFirstChild(player.Name .. "_MoveBillboard")
@@ -3812,7 +3978,7 @@ end)
 	-- ESP tab controls -----------------------------------------------------
 	local ddRow = Instance.new("Frame")
 	ddRow.Size = UDim2.new(1, 0, 0, 32)
-	ddRow.Position = UDim2.new(0, 0, 0, 504)
+	ddRow.Position = UDim2.new(0, 0, 0, 552)
 	ddRow.BackgroundTransparency = 1
 	ddRow.ZIndex = 20 -- keep the popup above the sliders it opens over
 	ddRow.Parent = tabFrames.esp
@@ -4013,14 +4179,14 @@ end)
 		end
 	end
 
-	local pipToggleRef = createToggle(tabFrames.esp, "Player PiP", 386, pipCfg.enabled, function(state)
+	local pipToggleRef = createToggle(tabFrames.esp, "Player PiP", 434, pipCfg.enabled, function(state)
 		applyEnabled(state)
 	end)
 	settingsRefs.pipEnabled = pipToggleRef
 
 	local pipAutoturnRef, pipEnemyLockRef
 
-	pipAutoturnRef = createToggle(tabFrames.esp, "PiP Autoturn", 424, pipCfg.autoturn, function(state)
+	pipAutoturnRef = createToggle(tabFrames.esp, "PiP Autoturn", 472, pipCfg.autoturn, function(state)
 		pipCfg.autoturn = state
 		if state and pipCfg.enemyLock then
 			pipCfg.enemyLock = false
@@ -4029,7 +4195,7 @@ end)
 	end)
 	settingsRefs.pipAutoturn = pipAutoturnRef
 
-	pipEnemyLockRef = createToggle(tabFrames.esp, "PiP Enemy Lock", 466, pipCfg.enemyLock, function(state)
+	pipEnemyLockRef = createToggle(tabFrames.esp, "PiP Enemy Lock", 514, pipCfg.enemyLock, function(state)
 		pipCfg.enemyLock = state
 		if state then
 			enemyAcc = 1 -- scan on the next frame
@@ -4746,6 +4912,19 @@ end, function(text, val)
     return text .. ": " .. string.format("%.0f ms", val * 1000)
 end)
 
+-- M1 Overwrite: a left click (or held click) drops our guard for the duration of
+-- the click, whoever raised it. Mirrors the game's own rule -- a held left click
+-- cannot block -- and doubles as the escape hatch for a guard stuck up.
+settingsRefs.m1Overwrite = createToggle(tabFrames.misc, "M1 Overwrite", 440, m1OverwriteEnabled, function(state)
+    m1OverwriteEnabled = state
+    if not state then
+        -- Stop owning the guard; the watchdog brings it back on its next tick.
+        attackClickDrop = false
+        attackDropHadScriptHold = false
+    end
+    autoSaveSettings()
+end)
+
 -- ====================== AUTOINFINITY ENEMY SCAN NOTICE ======================
 -- When AutoInfinity is on, scan every enemy's character (via the SpawnChar
 -- attribute, same signal the hook uses) and show which of their moves are
@@ -4837,8 +5016,8 @@ settingsRefs.counterKey = createKeybind(tabFrames.misc, "Counter Keybind", 260, 
     counterKey = key
 end)
 
-makeMiscHeader("Triggerbot", 442)
-triggerbotToggleObj = createToggle(tabFrames.misc, "Triggerbot", 464, tbState.enabled, function(state)
+makeMiscHeader("Triggerbot", 490)
+triggerbotToggleObj = createToggle(tabFrames.misc, "Triggerbot", 512, tbState.enabled, function(state)
     tbState.enabled = state
     if not state then
         tbState.pending1 = false
@@ -4847,14 +5026,14 @@ triggerbotToggleObj = createToggle(tabFrames.misc, "Triggerbot", 464, tbState.en
 end)
 settingsRefs.triggerbotEnabled = triggerbotToggleObj
 
-settingsRefs.triggerbotKey = createKeybind(tabFrames.misc, "Move 1 Keybind", 500, tbState.key, function(key)
+settingsRefs.triggerbotKey = createKeybind(tabFrames.misc, "Move 1 Keybind", 548, tbState.key, function(key)
     tbState.key = key
 end)
 
 do -- Move slot dropdown (1-4): determines which move slot triggerbot presses on activation
     local slotFrame = Instance.new("Frame")
     slotFrame.Size = UDim2.new(1, 0, 0, 32)
-    slotFrame.Position = UDim2.new(0, 0, 0, 536)
+    slotFrame.Position = UDim2.new(0, 0, 0, 584)
     slotFrame.BackgroundTransparency = 1
     slotFrame.Parent = tabFrames.misc
 
@@ -4936,14 +5115,14 @@ do -- Move slot dropdown (1-4): determines which move slot triggerbot presses on
     }
 end
 
-settingsRefs.triggerbot2Key = createKeybind(tabFrames.misc, "Move 2 Keybind", 572, tbState.key2, function(key)
+settingsRefs.triggerbot2Key = createKeybind(tabFrames.misc, "Move 2 Keybind", 620, tbState.key2, function(key)
     tbState.key2 = key
 end)
 
 do -- Move slot 2 dropdown (1-4): second triggerbot channel's move
     local slotFrame = Instance.new("Frame")
     slotFrame.Size = UDim2.new(1, 0, 0, 32)
-    slotFrame.Position = UDim2.new(0, 0, 0, 608)
+    slotFrame.Position = UDim2.new(0, 0, 0, 656)
     slotFrame.BackgroundTransparency = 1
     slotFrame.Parent = tabFrames.misc
 
@@ -5025,13 +5204,13 @@ do -- Move slot 2 dropdown (1-4): second triggerbot channel's move
     }
 end
 
-settingsRefs.triggerbotUnblockOnUse = createToggle(tabFrames.misc, "Unblock on use", 644, tbState.unblockOnUse, function(state)
+settingsRefs.triggerbotUnblockOnUse = createToggle(tabFrames.misc, "Unblock on use", 692, tbState.unblockOnUse, function(state)
     tbState.unblockOnUse = state
     autoSaveSettings()
 end)
 
-makeMiscHeader("Infinity", 686)
-local autoInfinityToggleObj = createToggle(tabFrames.misc, "AutoInfinity (JSON FILE)", 708, autoInfinityEnabled, function(state)
+makeMiscHeader("Infinity", 734)
+local autoInfinityToggleObj = createToggle(tabFrames.misc, "AutoInfinity (JSON FILE)", 756, autoInfinityEnabled, function(state)
     autoInfinityEnabled = state
     if state then
         autoInfinityLoadDatabase()
@@ -5045,32 +5224,32 @@ local autoInfinityToggleObj = createToggle(tabFrames.misc, "AutoInfinity (JSON F
 end)
 settingsRefs.autoInfinityEnabled = autoInfinityToggleObj
 
-settingsRefs.autoInfinityKey = createKeybind(tabFrames.misc, "AutoInfinity Keybind", 744, autoInfinityKey, function(key)
+settingsRefs.autoInfinityKey = createKeybind(tabFrames.misc, "AutoInfinity Keybind", 792, autoInfinityKey, function(key)
     autoInfinityKey = key
 end)
 
-settingsRefs.autoInfinityLookSensitivity = createSlider(tabFrames.misc, "Look sensitivity", 780, 0.1, 1.0, aiState.lookSensitivity, function(val)
+settingsRefs.autoInfinityLookSensitivity = createSlider(tabFrames.misc, "Look sensitivity", 828, 0.1, 1.0, aiState.lookSensitivity, function(val)
     aiState.lookSensitivity = val
 end, function(text, val)
     local deg = math.deg(math.acos(math.clamp(val, 0, 1)))
     return text .. ": " .. string.format("%.2f", val) .. string.format(" (%.0f degrees)", deg)
 end)
 
-settingsRefs.autoInfinityRayRadius = createSlider(tabFrames.misc, "Ray cast sensitivity", 828, 10, 100, aiState.rayRadius, function(val)
+settingsRefs.autoInfinityRayRadius = createSlider(tabFrames.misc, "Ray cast sensitivity", 876, 10, 100, aiState.rayRadius, function(val)
     aiState.rayRadius = val
 end)
 
-settingsRefs.autoInfinityUnlocked = createToggle(tabFrames.misc, "Autoinfinity unblock", 876, autoInfinityUnlocked, function(state)
+settingsRefs.autoInfinityUnlocked = createToggle(tabFrames.misc, "Autoinfinity unblock", 924, autoInfinityUnlocked, function(state)
     autoInfinityUnlocked = state
 end)
 
-makeMiscHeader("Utility", 914)
-settingsRefs.autoBlackFlashEnabled = createToggle(tabFrames.misc, "Auto Black Flash", 936, autoBlackFlashEnabled, function(state)
+makeMiscHeader("Utility", 962)
+settingsRefs.autoBlackFlashEnabled = createToggle(tabFrames.misc, "Auto Black Flash", 984, autoBlackFlashEnabled, function(state)
     autoBlackFlashEnabled = state
 	applyBlackFlashHook()
 end)
 
-settingsRefs.autoSprintEnabled = createToggle(tabFrames.misc, "Auto Sprint", 972, autoState.sprintEnabled, function(state)
+settingsRefs.autoSprintEnabled = createToggle(tabFrames.misc, "Auto Sprint", 1020, autoState.sprintEnabled, function(state)
     autoState.sprintEnabled = state
     if not state and autoState.sprintHeld then
         autoState.sprintHeld = false
@@ -5078,11 +5257,11 @@ settingsRefs.autoSprintEnabled = createToggle(tabFrames.misc, "Auto Sprint", 972
     end
     autoSaveSettings()
 end)
-settingsRefs.autoPlayEnabled = createToggle(tabFrames.misc, "Auto Play", 1008, autoPlayEnabled, function(state)
+settingsRefs.autoPlayEnabled = createToggle(tabFrames.misc, "Auto Play", 1056, autoPlayEnabled, function(state)
     autoPlayEnabled = state
 end)
 
-settingsRefs.toggleUIKey = createKeybind(tabFrames.misc, "Close/Open UI", 1044, toggleUIKey, function(key)
+settingsRefs.toggleUIKey = createKeybind(tabFrames.misc, "Close/Open UI", 1092, toggleUIKey, function(key)
     toggleUIKey = key
 end)
 
@@ -5216,7 +5395,7 @@ if oldTB then oldTB:Destroy() end
 local tbContainer = Instance.new("Frame")
 tbContainer.Name = "TargetBanContainer"
 tbContainer.Size = UDim2.new(1, 0, 0, 186)
-tbContainer.Position = UDim2.new(0, 0, 0, 1046)
+tbContainer.Position = UDim2.new(0, 0, 0, 1094)
 tbContainer.BackgroundTransparency = 1
 tbContainer.ClipsDescendants = false
 tbContainer.Parent = tabFrames.misc
@@ -5638,7 +5817,7 @@ end))
 -- PS Code Snatch Button
 local snatchBtn = Instance.new("TextButton")
 snatchBtn.Size = UDim2.new(1, 0, 0, 32)
-snatchBtn.Position = UDim2.new(0, 0, 0, 1276)
+snatchBtn.Position = UDim2.new(0, 0, 0, 1324)
 snatchBtn.BackgroundColor3 = Color3.fromRGB(115, 95, 230) -- Purple theme
 snatchBtn.Text = "PS Code Snatch"
 snatchBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -5650,7 +5829,7 @@ local snatchCorner = Instance.new("UICorner") snatchCorner.CornerRadius = UDim.n
 -- Test Hold Block button (holds F indefinitely until repressed; for triggerbot testing)
 local testHoldBtn = Instance.new("TextButton")
 testHoldBtn.Size = UDim2.new(1, 0, 0, 32)
-testHoldBtn.Position = UDim2.new(0, 0, 0, 1312)
+testHoldBtn.Position = UDim2.new(0, 0, 0, 1360)
 testHoldBtn.BackgroundColor3 = Color3.fromRGB(115, 95, 230) -- Purple theme
 testHoldBtn.Text = "Hold Block (Test)"
 testHoldBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -5858,7 +6037,7 @@ end)
 
 local nanamiBtn = Instance.new("TextButton")
 nanamiBtn.Size = UDim2.new(1, 0, 0, 32)
-nanamiBtn.Position = UDim2.new(0, 0, 0, 1240)
+nanamiBtn.Position = UDim2.new(0, 0, 0, 1288)
 nanamiBtn.BackgroundColor3 = Color3.fromRGB(115, 95, 230) -- Purple theme
 nanamiBtn.Text = "Auto Nanami"
 nanamiBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -5874,7 +6053,7 @@ end)
 -- Unload button inside Misc tab
 local unloadBtn = Instance.new("TextButton")
 unloadBtn.Size = UDim2.new(1, 0, 0, 32)
-unloadBtn.Position = UDim2.new(0, 0, 0, 1348)
+unloadBtn.Position = UDim2.new(0, 0, 0, 1396)
 unloadBtn.BackgroundColor3 = Color3.fromRGB(240, 80, 80)
 unloadBtn.Text = "Unload UI"
 unloadBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -5888,7 +6067,7 @@ end)
 
 local creditsLabel = Instance.new("TextLabel")
 creditsLabel.Size = UDim2.new(1, 0, 0, 20)
-creditsLabel.Position = UDim2.new(0, 0, 0, 1384)
+creditsLabel.Position = UDim2.new(0, 0, 0, 1432)
 creditsLabel.BackgroundTransparency = 1
 creditsLabel.Text = "Credits: @ace_rsss & kyoka"
 creditsLabel.TextColor3 = Color3.fromRGB(120, 120, 120)
@@ -6017,6 +6196,12 @@ unloadScript = function()
 	autoCounterEnabled = false
 	espState.moveEnabled = false
 	espState.inputsEnabled = false
+	espState.dashEnabled = false
+	for player in pairs(espState.dash) do
+		local dbb = parentGui:FindFirstChild(player.Name .. "_DashBillboard")
+		if dbb then dbb:Destroy() end
+	end
+	espState.dash = {}
 	autoBlackFlashEnabled = false
 	autoPlayEnabled = false
 	autoState.sprintEnabled = false
@@ -6434,6 +6619,9 @@ local function onPlayerRemoving(player)
 	local mBillboard = parentGui:FindFirstChild(player.Name .. "_MoveBillboard")
 	if mBillboard then mBillboard:Destroy() end
 	cdState.move[player] = nil
+	local dBillboard = parentGui:FindFirstChild(player.Name .. "_DashBillboard")
+	if dBillboard then dBillboard:Destroy() end
+	espState.dash[player] = nil
 	
 	for k in pairs(cdState.flashTimes) do
 		if k:find(player.Name .. "_") then
@@ -7675,7 +7863,7 @@ table.insert(connections, UserInputService.InputBegan:Connect(function(input, gp
 	if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
 	attackDropMouseDown = true
 	attackDropGraceUntil = 0 -- a fresh click cancels a pending restore
-	if not autoCounterEnabled or attackClickDrop then return end
+	if not autoCounterEnabled or not m1OverwriteEnabled or attackClickDrop then return end
 	if transitioningToCounter then return end -- a sequence owns F right now
 	if not (blockingState or UserInputService:IsKeyDown(Enum.KeyCode.F)) then return end
 	attackClickDrop = true
@@ -8641,11 +8829,10 @@ end
 -- the real press. The shared budget keeps the re-edge cadence slow and lets a
 -- fresh schedule extend the same window instead of adding more chatter.
 --
--- A re-edge also waits a beat PAST the end of our own swing: the uptilt's longer
--- endlag means a "release right after the swing" lands at almost the same instant
--- the watchdog wants to re-edge, and that up-window is what ate the release
--- (stale tracker -> the guard comes back on a finger that is already up).
-local REARM_POST_SWING_DELAY = 0.2
+-- A re-edge still waits for our own swing to finish (the game swallows F edges
+-- mid-swing), but it no longer adds a beat past the end of it: re-arming late
+-- kept the guard down longer than the swing itself and felt worse than the
+-- release collision it was meant to avoid.
 local blockReArmDeadline = 0
 local blockReArmReEdges = 0
 local blockReArmExtensions = 0
@@ -8710,11 +8897,11 @@ scheduleBlockReArm = function(deadline)
 			end
 			if transitioningToCounter then continue end -- a sequence owns F
 			if blockingNow then continue end -- block is up: nothing to do
-			if os.clock() < ownSwingEndsAt + REARM_POST_SWING_DELAY then
+			if os.clock() < ownSwingEndsAt then
 				-- Our own swing still owns the state: any edge now is swallowed by
 				-- the game and only opens a window that can eat a real user edge.
 				counterDiagThrottled("rearmSwingDefer", 0.5, "REARM_DEFER", "reason=ownSwing",
-					string.format("endsIn=%.2f", ownSwingEndsAt + REARM_POST_SWING_DELAY - os.clock()))
+					string.format("endsIn=%.2f", ownSwingEndsAt - os.clock()))
 				continue
 			end
 			blockReArmReEdges = blockReArmReEdges + 1
@@ -9442,6 +9629,67 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 	end)
 end))
 
+-- Dash CD ESP update: detects the target's dash from its horizontal velocity
+-- burst SHAPE (short, ~50 peak) and drives the green refill. Hysteresis opens a
+-- candidate burst above DASH_OPEN and closes it below DASH_CLOSE; only a short,
+-- dash-range burst is accepted, which rejects jumps, standing->run, sustained
+-- flight and big skill launches. The cooldown gate means one dash arms one refill.
+table.insert(connections, RunService.RenderStepped:Connect(function()
+	if not espState.dashEnabled then return end
+	local now = os.clock()
+	for player, entry in pairs(espState.dash) do
+		pcall(function()
+			local char = player.Character
+			local head = char and (char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart"))
+			if not head or not entry.billboard.Parent then
+				if entry.billboard.Parent then entry.billboard.Enabled = false end
+				return
+			end
+			if entry.billboard.Adornee ~= head then entry.billboard.Adornee = head end
+			entry.billboard.Enabled = true
+			local root = char:FindFirstChild("HumanoidRootPart")
+			if not root then return end
+			-- Fresh life: the dash is available again, drop any stale burst/cooldown.
+			if entry.char ~= char then
+				entry.char = char
+				entry.burstStart = nil
+				entry.burstPeak = 0
+				entry.dashStart = 0
+				entry.readyAt = 0
+			end
+			-- Horizontal velocity only (drop Y): a dash is purely horizontal, so a
+			-- straight-up double-jump is ~0 and cannot trigger, while a mid-air dash
+			-- still registers. Velocity (not position delta) because remote CFrame
+			-- replicates at ~20Hz and a per-frame position delta inflates speed ~3x.
+			local v = root.AssemblyLinearVelocity
+			local h = Vector3.new(v.X, 0, v.Z).Magnitude
+			if h > DASH_OPEN then
+				if not entry.burstStart then
+					entry.burstStart = now
+					entry.burstPeak = h
+				elseif h > entry.burstPeak then
+					entry.burstPeak = h
+				end
+			elseif entry.burstStart and h < DASH_CLOSE then
+				-- Burst ended: accept it as a dash only if it was SHORT and in the
+				-- dash peak range. Sustained flight/run is too long; big skill
+				-- launches exceed the peak cap; the cooldown gate blocks re-arms.
+				local dur = now - entry.burstStart
+				if dur >= DASH_MIN_DUR and dur <= DASH_MAX_DUR
+					and entry.burstPeak <= DASH_MAX_PEAK
+					and entry.burstStart >= entry.readyAt then
+					entry.dashStart = entry.burstStart
+					entry.readyAt = entry.burstStart + DASH_CD_SECONDS
+				end
+				entry.burstStart = nil
+				entry.burstPeak = 0
+			end
+			local frac = math.clamp((now - entry.dashStart) / DASH_CD_SECONDS, 0, 1)
+			setDashFill(entry, frac)
+		end)
+	end
+end))
+
 -- Persistent character tracking loop (Detects spawns/respawns reliably on client)
 local lastCharTrack = 0
 table.insert(connections, RunService.RenderStepped:Connect(function()
@@ -9460,6 +9708,9 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 				end
 				if not moveBillboard then
 					task.spawn(createMoveBillboard, player, char)
+				end
+				if espState.dashEnabled and not parentGui:FindFirstChild(player.Name .. "_DashBillboard") then
+					task.spawn(createDashBillboard, player, char)
 				end
 			end
 		end
