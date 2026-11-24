@@ -144,15 +144,15 @@ local attackClickDrop = false
 -- it can be resumed on release even with no finger on F.
 local attackDropHadScriptHold = false
 -- Mouse state + a short grace after release: tap-spam re-blocks the guard only
--- once the clicks actually stop, so every tap gets an F-up at swing time.
+-- once the clicks actually stop, so every tap gets a block-off at swing time.
 local attackDropMouseDown = false
 local attackDropGraceUntil = 0
-local testHoldBlock = false -- test utility: holds F until repressed
+local testHoldBlock = false -- test utility: holds the script block key until repressed
 local counterQueued = false
 local transitioningToCounter = false
 local blockStartTime = 0
 local lastCounterTime = 0
--- Block ownership (fix 1+2): generation counters + physical-vs-script F tracking.
+-- Block ownership (fix 1+2): generation counters + finger-vs-script hold tracking.
 -- blockGen: invalidates stale parry taps so only the newest tap owns the key.
 -- counterGen: shared by onBlockImpact/airSwingFire so only the newest counter owns transitioningToCounter.
 local blockGen = 0
@@ -164,18 +164,15 @@ local counterGen = 0
 -- Swing loop and every future parry until re-execution. Abort exits now clear
 -- the latch only while it still belongs to them.
 local transitionOwnerGen = 0
+-- Two block keys, two owners (measured live): the game sends BlockOn on any
+-- block key down and BlockOff on any block key up, so the block STATE is shared
+-- -- but the INPUTS are not. The finger keeps F for manual blocking; the script
+-- drives E for every block it raises. That removes the echo problem at the
+-- root: every F edge the game delivers is physical, and our synthetic hold can
+-- no longer mask the user's next press/release. E is only ever sent by us, so
+-- IsKeyDown(E) is an exact record of what we last asked for.
+local BLOCK_KEY = Enum.KeyCode.E
 local userHoldingF = false
--- Exact echo accounting for synthetic F presses (measured live: every virtual
--- press echoes exactly once into InputBegan/InputEnded, and IsKeyDown tracks
--- the virtual state, so timestamps + IsKeyDown polling cannot be trusted).
--- Each script press expects exactly one echo; a genuine finger event is only
--- consumed while its echo is still unarrived-but-fresh, which self-corrects in
--- either arrival order. Stale expectations expire (dropped echo safety).
-local pendingDownEcho = 0
-local pendingUpEcho = 0
-local lastDownStamp = 0
-local lastUpStamp = 0
-local ECHO_WINDOW = 0.25
 local lastBlockedAnims = {}
 local activeConnections = {}
 local autoCounterToggleObj = nil
@@ -379,12 +376,9 @@ local function counterDiagBlocking()
 	end
 	if char then bits[#bits + 1] = "blockAttr=" .. tostring(char:GetAttribute("Blocking")) end
 	bits[#bits + 1] = "isKeyDownF=" .. tostring(UserInputService:IsKeyDown(Enum.KeyCode.F))
+	bits[#bits + 1] = "isKeyDownE=" .. tostring(UserInputService:IsKeyDown(BLOCK_KEY))
 	bits[#bits + 1] = "userHoldingF=" .. tostring(userHoldingF)
 	bits[#bits + 1] = "blockingState=" .. tostring(blockingState)
-	bits[#bits + 1] = "pendingDown=" .. tostring(pendingDownEcho)
-	bits[#bits + 1] = "pendingUp=" .. tostring(pendingUpEcho)
-	if lastDownStamp > 0 then bits[#bits + 1] = string.format("downAge=%.3f", os.clock() - lastDownStamp) end
-	if lastUpStamp > 0 then bits[#bits + 1] = string.format("upAge=%.3f", os.clock() - lastUpStamp) end
 	local pingOk, ping = pcall(function() return LocalPlayer:GetNetworkPing() end)
 	if pingOk and type(ping) == "number" and ping > 0 then
 		bits[#bits + 1] = string.format("pingMs=%.0f", ping * 1000)
@@ -448,111 +442,57 @@ counterDiag("DIAG_READY", "on=" .. tostring(counterDiagEnv.PiggyCounterDiagOn),
 	"file=" .. tostring(counterDiagEnv.PiggyCounterFile),
 	"dump=getgenv().PiggyCounterDump()")
 
--- Script-owned F presses expect exactly one InputBegan/Ended echo each, so the
--- userHoldingF tracker below can tell synthetic presses apart from a physical
--- finger. CRITICAL: Roblox fires InputBegan/InputEnded only on real up->down /
--- down->up transitions, so a VIM send while the engine already holds that state
--- produces NO echo and leaves a stale credit that then EATS the user's next
--- genuine press/release (userHoldingF desync -> the stuck block that only a
--- repress+release clears; the post-counter REPRESS paths used to hit this every
--- time the finger was still down). Both senders therefore no-op when the
--- engine state already matches the request -- exactly when the event would do
--- nothing. A pending (in-flight) send disables the skip so a queued down/up
--- pair still lands in order.
-local function scriptFDown()
-	local alreadyDown = false
-	pcall(function()
-		alreadyDown = (pendingUpEcho == 0) and UserInputService:IsKeyDown(Enum.KeyCode.F)
-	end)
-	if alreadyDown then
-		counterDiag("SCRIPT_F_DOWN_SKIP", "reason=alreadyDown",
-			"blockingState=" .. tostring(blockingState), "transitioning=" .. tostring(transitioningToCounter))
-		return
+-- The script drives E for every block it raises; the finger keeps F. Separate
+-- keys mean no echo accounting is needed at all: an F event is always the
+-- finger, and E is only ever sent here, so IsKeyDown(E) tells us exactly what
+-- we last asked for. Roblox fires InputBegan/InputEnded only on real up->down /
+-- down->up transitions, so a send while the engine already holds that state
+-- would be a no-op -- skip it (and it keeps the diag quiet).
+local function scriptBlockRelease()
+	if UserInputService:IsKeyDown(BLOCK_KEY) then
+		counterDiag("SCRIPT_E_UP", "blockingState=" .. tostring(blockingState),
+			"transitioning=" .. tostring(transitioningToCounter))
+		pcall(function() VirtualInputManager:SendKeyEvent(false, BLOCK_KEY, false, game) end)
 	end
-	pendingDownEcho = pendingDownEcho + 1
-	lastDownStamp = os.clock()
-	local myStamp = lastDownStamp
-	counterDiag("SCRIPT_F_DOWN", "pendingDown=" .. tostring(pendingDownEcho),
-		"blockingState=" .. tostring(blockingState), "transitioning=" .. tostring(transitioningToCounter))
-	pcall(function() VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game) end)
-	-- Swallow check: if the engine never transitions (the game can drop F events
-	-- mid-swing), the pending echo credit is stale -- cancel it shortly so it
-	-- cannot eat the user's next real press/release. A newer send invalidates
-	-- this check via the stamp comparison.
-	task.spawn(function()
-		task.wait(0.1)
-		if lastDownStamp ~= myStamp then return end
-		local isDown = false
-		pcall(function() isDown = UserInputService:IsKeyDown(Enum.KeyCode.F) end)
-		if not isDown and pendingDownEcho > 0 then
-			pendingDownEcho = pendingDownEcho - 1
-			counterDiag("SCRIPT_F_DOWN_CANCEL", "reason=noTransition",
-				"pendingDown=" .. tostring(pendingDownEcho), counterDiagBlocking())
-		end
-	end)
 end
-local function scriptFUp()
-	local alreadyUp = false
-	pcall(function()
-		alreadyUp = (pendingDownEcho == 0) and (not UserInputService:IsKeyDown(Enum.KeyCode.F))
-	end)
-	if alreadyUp then
-		counterDiag("SCRIPT_F_UP_SKIP", "reason=alreadyUp",
+
+local function scriptBlockDown()
+	if UserInputService:IsKeyDown(BLOCK_KEY) then
+		counterDiag("SCRIPT_E_DOWN_SKIP", "reason=alreadyDown",
 			"blockingState=" .. tostring(blockingState), "transitioning=" .. tostring(transitioningToCounter))
 		return
 	end
-	pendingUpEcho = pendingUpEcho + 1
-	lastUpStamp = os.clock()
-	local myStamp = lastUpStamp
-	counterDiag("SCRIPT_F_UP", "pendingUp=" .. tostring(pendingUpEcho),
-		"blockingState=" .. tostring(blockingState), "transitioning=" .. tostring(transitioningToCounter))
-	pcall(function() VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game) end)
-	-- Swallow check, symmetric with scriptFDown: a synthetic release the engine
-	-- never applied leaves a stale credit that would eat the user's next real
-	-- release -- cancel it if no transition happened.
-	task.spawn(function()
-		task.wait(0.1)
-		if lastUpStamp ~= myStamp then return end
-		local isDown = false
-		pcall(function() isDown = UserInputService:IsKeyDown(Enum.KeyCode.F) end)
-		if isDown and pendingUpEcho > 0 then
-			pendingUpEcho = pendingUpEcho - 1
-			counterDiag("SCRIPT_F_UP_CANCEL", "reason=noTransition",
-				"pendingUp=" .. tostring(pendingUpEcho), counterDiagBlocking())
-		end
-	end)
+	counterDiag("SCRIPT_E_DOWN", "blockingState=" .. tostring(blockingState),
+		"transitioning=" .. tostring(transitioningToCounter))
+	pcall(function() VirtualInputManager:SendKeyEvent(true, BLOCK_KEY, false, game) end)
+end
+
+-- "Ensure the guard is down" -- every counter calls this before its M1. If our
+-- own E holds the block, one E-up releases it. If the guard is only up because
+-- the finger holds F, E is already up and a lone E-up is a no-op (no
+-- transition = no BlockOff), so pulse E down+up once to make the game emit the
+-- BlockOff -- the same drop the old synthetic F-up caused. The REPRESS/re-arm
+-- paths put the guard back for a finger that never left.
+local function scriptBlockUp()
+	if UserInputService:IsKeyDown(BLOCK_KEY) then
+		scriptBlockRelease()
+		return
+	end
+	if userHoldingF then
+		counterDiag("SCRIPT_E_PULSE", "reason=fingerHoldsF",
+			"blockingState=" .. tostring(blockingState), "transitioning=" .. tostring(transitioningToCounter))
+		pcall(function() VirtualInputManager:SendKeyEvent(true, BLOCK_KEY, false, game) end)
+		pcall(function() VirtualInputManager:SendKeyEvent(false, BLOCK_KEY, false, game) end)
+	end
 end
 table.insert(connections, UserInputService.InputBegan:Connect(function(input, _gp)
 	if input.KeyCode == Enum.KeyCode.F and input.UserInputType == Enum.UserInputType.Keyboard then
-		counterDiag("F_BEGIN_EV", "pD=" .. tostring(pendingDownEcho),
-			"pU=" .. tostring(pendingUpEcho),
-			"hold=" .. tostring(userHoldingF),
-			string.format("downAge=%.3f", os.clock() - lastDownStamp))
-		if pendingDownEcho > 0 and os.clock() - lastDownStamp < ECHO_WINDOW then
-			pendingDownEcho = pendingDownEcho - 1
-			counterDiag("F_DOWN_ECHO", "pendingDown=" .. tostring(pendingDownEcho),
-				string.format("age=%.3f", os.clock() - lastDownStamp))
-			return
-		end
-		pendingDownEcho = 0
 		userHoldingF = true
 		counterDiag("F_DOWN_PHYS", counterDiagBlocking())
 	end
 end))
 table.insert(connections, UserInputService.InputEnded:Connect(function(input)
 	if input.KeyCode == Enum.KeyCode.F and input.UserInputType == Enum.UserInputType.Keyboard then
-		counterDiag("F_END_EV", "pD=" .. tostring(pendingDownEcho),
-			"pU=" .. tostring(pendingUpEcho),
-			"hold=" .. tostring(userHoldingF),
-			string.format("upAge=%.3f", os.clock() - lastUpStamp))
-		if pendingUpEcho > 0 and os.clock() - lastUpStamp < ECHO_WINDOW then
-			pendingUpEcho = pendingUpEcho - 1
-			counterDiag("F_UP_ECHO", "pendingUp=" .. tostring(pendingUpEcho),
-				string.format("age=%.3f", os.clock() - lastUpStamp),
-				"userHoldingF=" .. tostring(userHoldingF))
-			return
-		end
-		pendingUpEcho = 0
 		counterDiag("F_UP_PHYS", "userHoldingF=" .. tostring(userHoldingF),
 			"counterGen=" .. tostring(counterGen),
 			"transitioning=" .. tostring(transitioningToCounter),
@@ -563,21 +503,14 @@ table.insert(connections, UserInputService.InputEnded:Connect(function(input)
 			counterGen = counterGen + 1
 			blockingState = false
 			airSwingArmed = nil
-			testHoldBlock = false
 			counterDiag("F_UP_BUMP", "counterGen=" .. tostring(counterGen),
 				"transitioning=" .. tostring(transitioningToCounter),
 				"LEAK_WINDOW=" .. tostring(transitioningToCounter))
-			scriptFUp()
-		else
-			-- Recovery: a physical release while we track nobody holding F
-			-- usually means a stale echo ate the press (REPRESS desync) and the
-			-- engine may still be blocking from an untracked synthetic down.
-			-- scriptFUp skips true no-ops, so this only fires a real release
-			-- when the engine is genuinely stuck down -- the block now
-			-- self-heals here instead of waiting for a repress+release cycle.
-			counterDiag("F_UP_PHYS_IGNORED", "reason=userHoldingF=false", "recover=scriptFUp")
-			scriptFUp()
 		end
+		-- The finger's own release already sent BlockOff, but the script may
+		-- still hold E (a ceded parry tap, or a block raised for the finger):
+		-- release it so our key never keeps the guard up after the finger left.
+		scriptBlockUp()
 	end
 end))
 pcall(function() userHoldingF = UserInputService:IsKeyDown(Enum.KeyCode.F) end)
@@ -3053,6 +2986,22 @@ local DASH_CLOSE = 45 -- burst closes below this (gap rejects run-speed hover)
 local DASH_MIN_DUR = 0.10
 local DASH_MAX_DUR = 0.60
 local DASH_MAX_PEAK = 90
+-- Awakened characters dash by teleporting (~13 studs over ~0.1s). Their reported
+-- velocity is not reliable: some report 0 even while running, others report a
+-- normal run speed, so an absolute velocity gate either blocks running dashes or
+-- lets velocity dashes through. Instead we compare two things over a 0.15s
+-- window: the PATH travelled (direction-independent, so a dash against the run
+-- direction still counts) and what the reported velocity accounts for. A
+-- velocity-driven dash travels exactly what its velocity predicts; a teleport
+-- travels ~13 studs more. Measured: run path speed 42, awakened dash 78-85.
+local DASH_TP_WINDOW = 0.15
+local DASH_TP_SPEED = 60 -- path speed over the window (run 42, awakened dash 78+)
+local DASH_TP_EXCESS = 7 -- studs travelled beyond what the velocity predicts
+local DASH_CD_AWAKEN = 0.97 -- measured minimum awakened dash-to-dash interval
+-- Base dashes are caught on the rising edge so the red is immediate; the shape
+-- check runs during the burst and rolls the red back if it was not a dash. Two
+-- edges closer than this are replication jitter inside one burst, not two dashes.
+local DASH_MIN_SPACING = 0.50
 local DASH_GREEN = Color3.fromRGB(50, 220, 60)
 local DASH_RED = Color3.fromRGB(225, 50, 45)
 
@@ -3159,10 +3108,16 @@ local function createDashBillboard(player, character)
 		clip = clip,
 		inner = inner,
 		char = character,
+		cd = DASH_CD_SECONDS,
 		readyAt = 0,
 		dashStart = 0,
 		burstStart = nil,
 		burstPeak = 0,
+		pending = false,
+		hist = {},
+		lastPos = nil,
+		pathAcc = 0,
+		calmT = 0,
 	}
 	setDashFill(espState.dash[player], 1)
 end
@@ -4445,12 +4400,15 @@ local function aiIsTeammate(player)
 	return LocalPlayer.Team == player.Team or LocalPlayer.TeamColor == player.TeamColor
 end
 local function pressInfinityKey()
-	if autoInfinityUnlocked and UserInputService:IsKeyDown(Enum.KeyCode.F) then
+	local guardUp = blockingState
+		or UserInputService:IsKeyDown(BLOCK_KEY)
+		or UserInputService:IsKeyDown(Enum.KeyCode.F)
+	if autoInfinityUnlocked and guardUp then
 		-- "Infinity unblock": drop the guard first so Infinity isn't
 		-- swallowed while we're holding block, then fire 4 after the
 		-- block physics drops (mirrors AutoCounter's unblock-then-M1).
 		blockingState = false
-		scriptFUp()
+		scriptBlockUp()
 		task.spawn(function()
 			task.wait(0.06)
 			VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Four, false, game)
@@ -5826,7 +5784,7 @@ snatchBtn.TextSize = 13
 snatchBtn.Parent = tabFrames.misc
 local snatchCorner = Instance.new("UICorner") snatchCorner.CornerRadius = UDim.new(0, 6) snatchCorner.Parent = snatchBtn
 
--- Test Hold Block button (holds F indefinitely until repressed; for triggerbot testing)
+-- Test Hold Block button (holds the script block key until repressed; for triggerbot testing)
 local testHoldBtn = Instance.new("TextButton")
 testHoldBtn.Size = UDim2.new(1, 0, 0, 32)
 testHoldBtn.Position = UDim2.new(0, 0, 0, 1360)
@@ -5843,17 +5801,18 @@ testHoldBtn.MouseButton1Click:Connect(function()
 	if testHoldBlock then
 		testHoldBtn.Text = "Hold Block: ON"
 		testHoldBtn.BackgroundColor3 = Color3.fromRGB(80, 200, 80)
-		scriptFDown()
+		scriptBlockDown()
 	else
 		testHoldBtn.Text = "Hold Block (Test)"
 		testHoldBtn.BackgroundColor3 = Color3.fromRGB(115, 95, 230)
-		scriptFUp()
+		scriptBlockRelease()
 	end
 end)
 
--- Persistence: re-assert F down on Heartbeat (runs even unfocused/minimized,
--- unlike RenderStepped) so the hold survives tabbing out or switching clients.
--- The game can drop virtual key state on focus loss; re-pressing is idempotent.
+-- Persistence: re-assert the block key down on Heartbeat (runs even
+-- unfocused/minimized, unlike RenderStepped) so the hold survives tabbing out or
+-- switching clients. The game can drop virtual key state on focus loss;
+-- re-pressing is idempotent.
 local lastTestHoldPulse = 0
 table.insert(connections, RunService.Heartbeat:Connect(function()
 	if not testHoldBlock then return end
@@ -5863,7 +5822,7 @@ table.insert(connections, RunService.Heartbeat:Connect(function()
 	local char = LocalPlayer.Character
 	local hum = char and char:FindFirstChildOfClass("Humanoid")
 	if not char or not hum or hum.Health <= 0 then return end
-	scriptFDown()
+	scriptBlockDown()
 end))
 
 
@@ -6248,13 +6207,10 @@ unloadScript = function()
 	
 
 	
-	if blockingState then
-		blockingState = false
-		VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
-	end
+	blockingState = false
+	scriptBlockRelease()
 	if testHoldBlock then
 		testHoldBlock = false
-		VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
 	end
 	if autoState.sprintHeld then
 		autoState.sprintHeld = false
@@ -6957,7 +6913,7 @@ local function checkShouldBlock()
 	-- Safety timeout: if blockingState is stuck, force clear it after 1s
 	if blockingState and os.clock() - blockStartTime > 1.0 then
 		blockingState = false
-		scriptFUp()
+		scriptBlockUp()
 	end
 	if blockingState then return false end
 
@@ -7209,15 +7165,15 @@ local function doParryTap(track)
 		end
 		-- Ensure we are still in blockingState and haven't transitioned to counter during the wait
 		if blockingState and not transitioningToCounter and not attackClickDrop then
-			scriptFDown()
+			scriptBlockDown()
 			counterDiag("PARRY_TAP_DOWN", "gen=" .. tostring(myGen),
 				"hold=" .. tostring(autoCounterEnabled and blockHoldForCounter or blockTapDuration))
 			-- Balance flag: if a newer generation kills us after this point,
 			-- we MUST release our own press on the way out, otherwise the
-			-- game is left holding F with nobody owning it (stuck block that
-			-- only a physical F cycle clears). The killer always unblocks
-			-- first (counters scriptFUp unconditionally; a newer tap sends
-			-- its own fresh down), so releasing here is safe either way.
+			-- game is left holding the block key with nobody owning it (a
+			-- stuck guard). The killer always unblocks first (counters
+			-- scriptBlockUp unconditionally; a newer tap sends its own fresh
+			-- down), so releasing here is safe either way.
 			local sentDown = true
 
 			local holdDuration = autoCounterEnabled and blockHoldForCounter or blockTapDuration
@@ -7239,7 +7195,7 @@ local function doParryTap(track)
 					"userHoldingF=" .. tostring(userHoldingF))
 				if sentDown then
 					sentDown = false
-					scriptFUp()
+					scriptBlockUp()
 				end
 				return
 			end
@@ -7250,7 +7206,7 @@ local function doParryTap(track)
 					counterDiag("PARRY_TAP_CEDE", "gen=" .. tostring(myGen), "userHoldingF=true")
 				else
 					counterDiag("PARRY_TAP_END", "gen=" .. tostring(myGen), "userHoldingF=false")
-					scriptFUp()
+					scriptBlockUp()
 				end
 			end
 		else
@@ -7270,7 +7226,7 @@ end
 -- scan first noticed it. Crank it late to punish deep recovery.
 -- When it expires the swing has landed-or-whiffed either way, so we M1 straight
 -- into their recovery -- no block impact required, even while holding block.
--- F is only touched at the fire instant (release to swing, re-press to restore
+-- The block key is only touched at the fire instant (release to swing, re-press to restore
 -- a hold), never while tracking. A real impact always wins the race first
 -- (it is event-driven and instant; the timer is deliberately biased late), so
 -- whatever is still standing at expiry is a whiff by definition. M1 startups
@@ -7285,7 +7241,7 @@ local airSwingArmed = nil -- { root, t0 } (tracking only, never touches block)
 -- True when WE are holding block right now (key down, or the game showing it).
 -- Air Swing only answers swings fired while this holds -- see the arm gate.
 local function isAirSwingHolding()
-	if UserInputService:IsKeyDown(Enum.KeyCode.F) then return true end
+	if UserInputService:IsKeyDown(Enum.KeyCode.F) or UserInputService:IsKeyDown(BLOCK_KEY) then return true end
 	local c = LocalPlayer.Character
 	if not c then return false end
 	local b = c:FindFirstChild("Blocking")
@@ -7477,12 +7433,12 @@ local function airSwingFire()
 		"hadScriptHold=" .. tostring(hadScriptHold), counterDiagBlocking())
 
 			-- Unblock/time/reblock mechanics only -- there is no impact trigger here.
-	-- The server eats M1s thrown while blocking, so F must be released for the
+	-- The server eats M1s thrown while blocking, so the block key must be released for the
 	-- punish to exist at all, then re-pressed so a physical hold survives intact.
 	task.spawn(function()
 		local ok, err = pcall(function()
 			blockingState = false
-			scriptFUp()
+			scriptBlockUp()
 			counterDiag("AIR_UNBLOCK", "gen=" .. tostring(myGen),
 				"counterM1Delay=" .. tostring(counterM1Delay))
 
@@ -7538,7 +7494,7 @@ local function airSwingFire()
 			counterDiag("REPRESS", "src=airswing", "reason=fingerStillDown",
 				"autoBlockEnabled=" .. tostring(autoBlockEnabled),
 				"hadScriptHold=" .. tostring(hadScriptHold))
-			scriptFDown()
+			scriptBlockDown()
 			if autoBlockEnabled then
 				blockingState = true
 				blockStartTime = os.clock()
@@ -7549,7 +7505,7 @@ local function airSwingFire()
 			-- Resume script's own hold (no finger involved).
 			counterDiag("REPRESS", "src=airswing", "reason=hadScriptHold",
 				"releaseOwner=none", "autoBlockEnabled=true")
-			scriptFDown()
+			scriptBlockDown()
 			blockingState = true
 			blockStartTime = os.clock()
 		else
@@ -7697,8 +7653,8 @@ local function setupGlobalCounterListener()
 				-- Force clear blockingState so parry loop is ready
 				blockingState = false
 				
-				-- Release F key IMMEDIATELY to exit block state instantly
-				scriptFUp()
+				-- Release the block key IMMEDIATELY to exit block state instantly
+				scriptBlockUp()
 				counterDiag("IMPACT_UNBLOCK", "gen=" .. tostring(myGen),
 					"counterM1Delay=" .. tostring(counterM1Delay))
 				do end
@@ -7746,20 +7702,20 @@ local function setupGlobalCounterListener()
 				counterDiag("COUNTER_ERROR", "src=impact", tostring(err))
 				do end
 				blockingState = false
-				scriptFUp()
+				scriptBlockUp()
 			end
 			transitioningToCounter = false
 			counterDiag("TRANSITION_OFF", "src=impact", "gen=" .. tostring(myGen),
 				string.format("heldFor=%.3f", os.clock() - transitionStarted))
 
 			-- Re-apply block after the counter only if the finger is still down,
-			-- so holding F the whole time keeps blocking after the counter M1.
+			-- so holding block the whole time keeps blocking after the counter M1.
 			if wasUserHolding and userHoldingF and not attackClickDrop then
 				counterDiag("REPRESS", "src=impact", "reason=fingerStillDown",
 					"autoBlockEnabled=" .. tostring(autoBlockEnabled))
 				blockingState = true
 				blockStartTime = os.clock()
-				scriptFDown()
+				scriptBlockDown()
 				do end
 			else
 				counterDiag("NO_REPRESS", "src=impact",
@@ -7864,12 +7820,12 @@ table.insert(connections, UserInputService.InputBegan:Connect(function(input, gp
 	attackDropMouseDown = true
 	attackDropGraceUntil = 0 -- a fresh click cancels a pending restore
 	if not autoCounterEnabled or not m1OverwriteEnabled or attackClickDrop then return end
-	if transitioningToCounter then return end -- a sequence owns F right now
-	if not (blockingState or UserInputService:IsKeyDown(Enum.KeyCode.F)) then return end
+	if transitioningToCounter then return end -- a sequence owns the block key right now
+	if not (blockingState or UserInputService:IsKeyDown(Enum.KeyCode.F) or UserInputService:IsKeyDown(BLOCK_KEY)) then return end
 	attackClickDrop = true
 	attackDropHadScriptHold = autoBlockEnabled and blockingState
 	blockingState = false
-	scriptFUp()
+	scriptBlockUp()
 	counterDiag("ATTACK_DROP", "src=click", "userHoldingF=" .. tostring(userHoldingF),
 		"hadScriptHold=" .. tostring(attackDropHadScriptHold), counterDiagBlocking())
 end))
@@ -7884,17 +7840,17 @@ table.insert(connections, UserInputService.InputEnded:Connect(function(input)
 		if not attackClickDrop then return end
 		attackClickDrop = false
 		attackDropHadScriptHold = false
-		if transitioningToCounter then return end -- a sequence owns F right now
+		if transitioningToCounter then return end -- a sequence owns the block key right now
 		if tbState.unblock[1] or tbState.unblock[2] then return end -- triggerbot drop owns it
 		if userHoldingF then
-			scriptFDown()
+			scriptBlockDown()
 			if autoBlockEnabled then
 				blockingState = true
 				blockStartTime = os.clock()
 			end
 			counterDiag("ATTACK_REBLOCK", "src=click", "reason=fingerStillDown")
 		elseif hadScriptHold and autoBlockEnabled then
-			scriptFDown()
+			scriptBlockDown()
 			blockingState = true
 			blockStartTime = os.clock()
 			counterDiag("ATTACK_REBLOCK", "src=click", "reason=hadScriptHold")
@@ -8809,29 +8765,26 @@ local function isTriggerBlocking(char)
 end
 
 -- Post-swing block re-arm (definition; see the forward declaration above).
--- The counters re-press F ~0.1s after their first M1, which can land while our
--- own swing animation is still running -- the game swallows F edges mid-swing,
--- so a buffered block never comes out, and the engine-level F state that the
--- swallowed press leaves behind also MASKS the user's next physical edges
--- (no up->down transition = no event). Their rapid release+repress afterwards
--- then does nothing and the block stays dead. This watchdog keeps re-edging F
--- with a clean up->down pair while "F held but not blocking" holds, until the
--- block finally comes out or the deadline passes. It never re-edges while our
--- own M1 animation is still playing (the game swallows edges mid-swing, and the
--- up-window would eat a real release), and it only acts while the finger
--- tracker still says the user wants the guard -- the engine key state cannot be
--- trusted for that, because our own synthetic press is what holds it down.
+-- The counters re-press the block key ~0.1s after their first M1, which can land
+-- while our own swing animation is still running -- the game swallows block
+-- edges mid-swing, so a buffered block never comes out, and our E is left held
+-- down with no block. This watchdog keeps re-edging E with a clean up->down pair
+-- while "guard wanted but not blocking" holds, until the block finally comes out
+-- or the deadline passes. It never re-edges while our own M1 animation is still
+-- playing (the game swallows edges mid-swing, and the up-window would eat a real
+-- release), and it only acts while the finger tracker (or Auto Block) still says
+-- the guard is wanted. E is the script's key alone, so this cycle can never mask
+-- a physical F edge the way the old synthetic F re-edge did.
 --
 -- One shared watchdog for the whole script, not one per counter: a live capture
--- showed five rapid counters stacking five watchdogs that chattered synthetic F
--- edges every ~30-100ms (20+ interleaved up/down pairs in two seconds) -- and a
--- synthetic edge landing inside the user's release/re-tap window is what eats
--- the real press. The shared budget keeps the re-edge cadence slow and lets a
--- fresh schedule extend the same window instead of adding more chatter.
+-- showed five rapid counters stacking five watchdogs that chattered synthetic
+-- edges every ~30-100ms (20+ interleaved up/down pairs in two seconds). The
+-- shared budget keeps the re-edge cadence slow and lets a fresh schedule extend
+-- the same window instead of adding more chatter.
 --
--- A re-edge still waits for our own swing to finish (the game swallows F edges
--- mid-swing), but it no longer adds a beat past the end of it: re-arming late
--- kept the guard down longer than the swing itself and felt worse than the
+-- A re-edge still waits for our own swing to finish (the game swallows block
+-- edges mid-swing), but it no longer adds a beat past the end of it: re-arming
+-- late kept the guard down longer than the swing itself and felt worse than the
 -- release collision it was meant to avoid.
 local blockReArmDeadline = 0
 local blockReArmReEdges = 0
@@ -8852,7 +8805,11 @@ scheduleBlockReArm = function(deadline)
 			local char = LocalPlayer.Character
 			if not char then break end
 			local fingerHeld = false
-			pcall(function() fingerHeld = userHoldingF end)
+			pcall(function()
+				-- F is the finger's key alone now: the engine state is trustworthy
+				-- (our synthetic presses live on E and can no longer mask it).
+				fingerHeld = userHoldingF or UserInputService:IsKeyDown(Enum.KeyCode.F)
+			end)
 			local wantGuard = fingerHeld or autoBlockEnabled
 			local blockingNow = false
 			pcall(function() blockingNow = isTriggerBlocking(char) end)
@@ -8887,15 +8844,14 @@ scheduleBlockReArm = function(deadline)
 				end
 			end
 			if not wantGuard then
-				-- Do NOT fall back to IsKeyDown here: the engine F is down because
-				-- of our own synthetic press, so it says "held" even after the user
-				-- released. Trusting it re-blocks a released finger and leaves the
-				-- guard stuck ON. Log the mismatch so a stale-false tracker shows up.
+				-- No finger and Auto Block off: nothing wants the guard, so leave
+				-- it down. Log both key states so a stale-false tracker shows up.
 				counterDiagThrottled("rearmNoHold", 1.0, "REARM_SKIP", "reason=noFinger",
-					"keyDown=" .. tostring(UserInputService:IsKeyDown(Enum.KeyCode.F)))
+					"keyF=" .. tostring(UserInputService:IsKeyDown(Enum.KeyCode.F)),
+					"keyE=" .. tostring(UserInputService:IsKeyDown(BLOCK_KEY)))
 				continue
 			end
-			if transitioningToCounter then continue end -- a sequence owns F
+			if transitioningToCounter then continue end -- a sequence owns the block key
 			if blockingNow then continue end -- block is up: nothing to do
 			if os.clock() < ownSwingEndsAt then
 				-- Our own swing still owns the state: any edge now is swallowed by
@@ -8908,21 +8864,24 @@ scheduleBlockReArm = function(deadline)
 			counterDiag("BLOCK_REARM", "src=counter",
 				"reEdges=" .. tostring(blockReArmReEdges),
 				string.format("deadlineIn=%.2f", blockReArmDeadline - os.clock()))
-			scriptFUp()
+			-- The guard is already known down here, so release only our own E
+			-- (a finger-held F must not be pulsed): the fresh E edge that follows
+			-- is what re-raises it.
+			scriptBlockRelease()
 			task.wait(0.03)
 			if transitioningToCounter then break end -- claimed mid-edge
-			scriptFDown()
+			scriptBlockDown()
 			-- A re-edge that lands mid-swing is swallowed by the game and leaves
-			-- the engine F held down with no block -- exactly the stuck state. Log
-			-- it so a capture shows whether the retry actually took; the loop then
-			-- tries again on the next tick until the deadline.
+			-- our E held down with no block -- exactly the stuck state. Log it so
+			-- a capture shows whether the retry actually took; the loop then tries
+			-- again on the next tick until the deadline.
 			task.wait(0.12)
 			if transitioningToCounter then break end
 			local took = false
 			pcall(function() took = isTriggerBlocking(char) end)
 			if not took then
 				counterDiag("REARM_SWALLOWED", "reEdges=" .. tostring(blockReArmReEdges),
-					"isKeyDownF=" .. tostring(UserInputService:IsKeyDown(Enum.KeyCode.F)))
+					"isKeyDownE=" .. tostring(UserInputService:IsKeyDown(BLOCK_KEY)))
 			end
 			if autoBlockEnabled then
 				blockingState = true
@@ -9036,7 +8995,7 @@ end
 
 -- Restores the guard a channel's "Unblock on use" drop removed, once that
 -- shot resolves: release the transition latch (only if this drop owns it)
--- and re-press F for a finger that never left, or for a script hold the drop
+-- and re-press the block key for a finger that never left, or for a script hold the drop
 -- killed. Runs once per shot instead of per retry -- re-blocking between
 -- fire attempts is what made the guard stutter and wedge. Spawned with a short
 -- beat so the move press always lands before the guard returns.
@@ -9062,14 +9021,14 @@ local function resolveChannelUnblock(idx)
 		if transitioningToCounter and transitionOwnerGen ~= ownerGen then return end
 		if attackClickDrop then return end -- a held click owns the guard down
 		if userHoldingF then
-			scriptFDown()
+			scriptBlockDown()
 			if autoBlockEnabled then
 				blockingState = true
 				blockStartTime = os.clock()
 			end
 			counterDiag("TRIGGER_REBLOCK", "src=triggerbot", "reason=fingerStillDown")
 		elseif hadScriptHold and autoBlockEnabled then
-			scriptFDown()
+			scriptBlockDown()
 			blockingState = true
 			blockStartTime = os.clock()
 			counterDiag("TRIGGER_REBLOCK", "src=triggerbot", "reason=hadScriptHold")
@@ -9196,7 +9155,7 @@ local function evalTriggerChannel(idx, now, markChanged, justUnblocked)
 			blockGen = blockGen + 1 -- kill in-flight parry taps so they cannot re-press or release over us
 			tbState.unblockScriptHold[idx] = blockingState
 			blockingState = false
-			scriptFUp()
+			scriptBlockUp()
 			tbState.unblock[idx] = true
 			tbState.unblockGen[idx] = mySeq
 			counterDiag("TRIGGER_UNBLOCK", "src=triggerbot", "slot=" .. tostring(slot),
@@ -9209,7 +9168,7 @@ local function evalTriggerChannel(idx, now, markChanged, justUnblocked)
 		end
 		fireSkillKey(slot)
 		-- Put the guard back on a short fixed beat, independent of the shot's
-		-- cooldown confirmation. The skill press only needs the F-up at the press
+		-- cooldown confirmation. The skill press only needs the block-off at the press
 		-- instant; holding the guard down until the request resolves (which can
 		-- take several frames, or the whole retry budget) leaves a long window in
 		-- which a real release is invisible to the engine -- the tracker then
@@ -9220,7 +9179,7 @@ local function evalTriggerChannel(idx, now, markChanged, justUnblocked)
 			if transitioningToCounter and transitionOwnerGen ~= tbState.unblockGen[idx] then return end
 			if attackClickDrop then return end -- a held click owns the guard down
 			if userHoldingF then
-				scriptFDown()
+				scriptBlockDown()
 				if autoBlockEnabled then
 					blockingState = true
 					blockStartTime = os.clock()
@@ -9228,7 +9187,7 @@ local function evalTriggerChannel(idx, now, markChanged, justUnblocked)
 				counterDiag("TRIGGER_REBLOCK", "src=triggerbot", "reason=earlyBeat",
 					"slot=" .. tostring(slot))
 			elseif tbState.unblockScriptHold[idx] and autoBlockEnabled then
-				scriptFDown()
+				scriptBlockDown()
 				blockingState = true
 				blockStartTime = os.clock()
 				counterDiag("TRIGGER_REBLOCK", "src=triggerbot", "reason=earlyBeatScriptHold",
@@ -9263,7 +9222,7 @@ end
 				transitioningToCounter = false
 			end
 			if userHoldingF and not attackClickDrop then
-				scriptFDown()
+				scriptBlockDown()
 				if autoBlockEnabled then
 					blockingState = true
 					blockStartTime = os.clock()
@@ -9629,11 +9588,15 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 	end)
 end))
 
--- Dash CD ESP update: detects the target's dash from its horizontal velocity
--- burst SHAPE (short, ~50 peak) and drives the green refill. Hysteresis opens a
--- candidate burst above DASH_OPEN and closes it below DASH_CLOSE; only a short,
--- dash-range burst is accepted, which rejects jumps, standing->run, sustained
--- flight and big skill launches. The cooldown gate means one dash arms one refill.
+-- Dash CD ESP update, two detectors feeding one refill:
+--  * base dash = a SHORT horizontal velocity burst (~0.35s pinned at the 50 cap).
+--    Hysteresis opens above DASH_OPEN and closes below DASH_CLOSE, and only a
+--    dash-range duration/peak is accepted, which rejects jumps, standing->run,
+--    sustained flight and big skill launches.
+--  * awakened dash = a CFrame teleport, caught by path travelled over a 0.15s
+--    window vs. what the reported velocity predicts (run path speed 42,
+--    awakened dash 78+). Works whether or not the character reports velocity.
+-- Each dash arms one refill, timed by that dash's own cooldown.
 table.insert(connections, RunService.RenderStepped:Connect(function()
 	if not espState.dashEnabled then return end
 	local now = os.clock()
@@ -9654,8 +9617,13 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 				entry.char = char
 				entry.burstStart = nil
 				entry.burstPeak = 0
+				entry.pending = false
 				entry.dashStart = 0
 				entry.readyAt = 0
+				entry.hist = {}
+				entry.lastPos = nil
+				entry.pathAcc = 0
+				entry.calmT = 0
 			end
 			-- Horizontal velocity only (drop Y): a dash is purely horizontal, so a
 			-- straight-up double-jump is ~0 and cannot trigger, while a mid-air dash
@@ -9665,26 +9633,77 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 			local h = Vector3.new(v.X, 0, v.Z).Magnitude
 			if h > DASH_OPEN then
 				if not entry.burstStart then
+					-- Rising edge: arm the refill IMMEDIATELY rather than waiting for
+					-- the burst to end. The shape check then runs while the burst is
+					-- still open and rolls the red back if it turns out not to be a
+					-- dash, so a real dash is never missed for being merged into
+					-- another movement.
 					entry.burstStart = now
 					entry.burstPeak = h
-				elseif h > entry.burstPeak then
-					entry.burstPeak = h
+					-- Only arm if the edge itself is in the dash range: a launch
+					-- already above the cap is a skill, not a dash.
+					if now - entry.dashStart > DASH_MIN_SPACING and h <= DASH_MAX_PEAK then
+						entry.dashStart = now
+						entry.cd = DASH_CD_SECONDS
+						entry.readyAt = now + DASH_CD_SECONDS
+						entry.pending = true
+					end
+				else
+					if h > entry.burstPeak then entry.burstPeak = h end
+					if entry.pending and (h > DASH_MAX_PEAK or now - entry.burstStart > DASH_MAX_DUR) then
+						-- Skill launch (peak far above the dash cap) or sustained
+						-- movement (flight): undo the optimistic red.
+						entry.pending = false
+						if entry.dashStart == entry.burstStart then entry.dashStart = 0 end
+					end
 				end
 			elseif entry.burstStart and h < DASH_CLOSE then
-				-- Burst ended: accept it as a dash only if it was SHORT and in the
-				-- dash peak range. Sustained flight/run is too long; big skill
-				-- launches exceed the peak cap; the cooldown gate blocks re-arms.
-				local dur = now - entry.burstStart
-				if dur >= DASH_MIN_DUR and dur <= DASH_MAX_DUR
-					and entry.burstPeak <= DASH_MAX_PEAK
-					and entry.burstStart >= entry.readyAt then
-					entry.dashStart = entry.burstStart
-					entry.readyAt = entry.burstStart + DASH_CD_SECONDS
+				-- Burst ended. A dash lasts ~0.35s, so a blink under 0.1s is
+				-- replication jitter rather than a dash -> undo the optimistic red.
+				if entry.pending then
+					entry.pending = false
+					if now - entry.burstStart < DASH_MIN_DUR and entry.dashStart == entry.burstStart then
+						entry.dashStart = 0
+					end
 				end
 				entry.burstStart = nil
 				entry.burstPeak = 0
 			end
-			local frac = math.clamp((now - entry.dashStart) / DASH_CD_SECONDS, 0, 1)
+			-- Awakened dash: teleport, so measure PATH travelled over a fixed window
+			-- (per-frame deltas cannot tell a teleport from a replication gap) and
+			-- subtract what the reported velocity accounts for. Path, not net
+			-- displacement, so dashing against the run direction still counts; the
+			-- excess test rejects velocity dashes (they travel exactly what their
+			-- velocity predicts), so no absolute velocity gate is needed, and a
+			-- running target can still be caught when its dash is CFrame-driven.
+			local hist = entry.hist
+			local pos = root.Position
+			if entry.lastPos then
+				local dl = pos - entry.lastPos
+				entry.pathAcc = entry.pathAcc + math.sqrt(dl.X * dl.X + dl.Z * dl.Z)
+			end
+			entry.lastPos = pos
+			hist[#hist + 1] = { t = now, path = entry.pathAcc }
+			while #hist > 2 and now - hist[1].t > 0.30 do table.remove(hist, 1) end
+			local base = nil
+			for i = #hist, 1, -1 do
+				if now - hist[i].t <= DASH_TP_WINDOW + 0.02 then base = hist[i] end
+			end
+			if base and now - base.t >= 0.10 then
+				local dt = now - base.t
+				local path = entry.pathAcc - base.path
+				local excess = path - h * dt
+				-- No excess = pure velocity movement; remember when it was last calm
+				-- so a detected dash is back-dated to its true start.
+				if excess < 2 then entry.calmT = now end
+				if path / dt > DASH_TP_SPEED and excess > DASH_TP_EXCESS
+					and now >= entry.readyAt then
+					entry.dashStart = math.max(entry.calmT, base.t)
+					entry.cd = DASH_CD_AWAKEN
+					entry.readyAt = entry.dashStart + DASH_CD_AWAKEN
+				end
+			end
+			local frac = math.clamp((now - entry.dashStart) / entry.cd, 0, 1)
 			setDashFill(entry, frac)
 		end)
 	end
