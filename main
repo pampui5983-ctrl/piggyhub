@@ -72,12 +72,13 @@ local tbState = {
 	markChar = nil, -- was triggerbotMarkChar
 	wasBlocking = false, -- was triggerbotWasBlocking
 	unblockOnUse = false, -- drop our guard before firing when the target drops theirs
+	reactOnBlock = { false, false }, -- per channel: fire while the target holds block (on the block edge) instead of on their unblock
 	unblock = { false, false }, -- per channel: guard dropped for the active request
 	unblockGen = { 0, 0 }, -- transitionOwnerGen snapshot owning that drop
 	unblockScriptHold = { false, false }, -- script hold the drop killed
 	lastFire = 0, -- was lastTriggerFire
 	lastFire2 = 0, -- was lastTriggerFire2
-	refire = 0.2, -- was triggerRefire; repeated-attempt cadence while the target is not blocking
+	refire = 0.2, -- was triggerRefire; repeated-attempt cadence while the target is in the channel's reacted state (not blocking / blocking)
 	awaitingCd = false, -- was triggerbotAwaitingCd
 	pressTime = 0, -- was triggerbotPressTime
 	awaitingCd2 = false, -- was triggerbot2AwaitingCd
@@ -939,7 +940,7 @@ tabFrames.misc.Position = UDim2.new(0, 140, 0, 10)
 tabFrames.misc.BackgroundTransparency = 1
 tabFrames.misc.Visible = false
 tabFrames.misc.Parent = bodyFrame
-tabFrames.misc.CanvasSize = UDim2.new(0, 0, 0, 1480)
+tabFrames.misc.CanvasSize = UDim2.new(0, 0, 0, 1552)
 tabFrames.misc.ScrollBarThickness = 6
 tabFrames.misc.ScrollBarImageColor3 = Color3.fromRGB(80, 80, 95)
 tabFrames.misc.ScrollingDirection = Enum.ScrollingDirection.Y
@@ -1820,6 +1821,8 @@ function ConfigManager.collectSettings()
 		triggerbot2Key = (tbState.key2 and tbState.key2.Name) or "None",
 		triggerbot2Slot = tbState.slot2,
 		triggerbotUnblockOnUse = tbState.unblockOnUse,
+		triggerbotReactOnBlock = tbState.reactOnBlock[1],
+		triggerbot2ReactOnBlock = tbState.reactOnBlock[2],
 		autoInfinityKey = (autoInfinityKey and autoInfinityKey.Name) or "None",
 		toggleUIKey = (toggleUIKey and toggleUIKey.Name) or "None",
 		autoBlackFlashEnabled = autoBlackFlashEnabled,
@@ -1932,6 +1935,8 @@ function ConfigManager.load(name)
 	if data.triggerbot2Key then tbState.key2 = decodeKeybind(data.triggerbot2Key, tbState.key2) end
 	if type(data.triggerbot2Slot) == "number" then tbState.slot2 = math.clamp(math.floor(data.triggerbot2Slot), 1, 4) end
 	tbState.unblockOnUse = data.triggerbotUnblockOnUse == true
+	tbState.reactOnBlock[1] = data.triggerbotReactOnBlock == true
+	tbState.reactOnBlock[2] = data.triggerbot2ReactOnBlock == true
 	if data.counterKey then counterKey = decodeKeybind(data.counterKey, counterKey) end
 	if data.autoInfinityKey then autoInfinityKey = decodeKeybind(data.autoInfinityKey, autoInfinityKey) end
 	if data.toggleUIKey then toggleUIKey = decodeKeybind(data.toggleUIKey, toggleUIKey) end
@@ -2027,6 +2032,8 @@ function ConfigManager.load(name)
 	if settingsRefs.triggerbot2Key then settingsRefs.triggerbot2Key.Set(tbState.key2) end
 	if settingsRefs.triggerbot2Slot then settingsRefs.triggerbot2Slot.Set(tbState.slot2) end
 	if settingsRefs.triggerbotUnblockOnUse then settingsRefs.triggerbotUnblockOnUse.Set(tbState.unblockOnUse) end
+	if settingsRefs.triggerbotReactOnBlock then settingsRefs.triggerbotReactOnBlock.Set(tbState.reactOnBlock[1]) end
+	if settingsRefs.triggerbot2ReactOnBlock then settingsRefs.triggerbot2ReactOnBlock.Set(tbState.reactOnBlock[2]) end
 	if settingsRefs.counterKey then settingsRefs.counterKey.Set(counterKey) end
 	if settingsRefs.autoInfinityKey then settingsRefs.autoInfinityKey.Set(autoInfinityKey) end
 	if settingsRefs.toggleUIKey then settingsRefs.toggleUIKey.Set(toggleUIKey) end
@@ -5073,14 +5080,19 @@ do -- Move slot dropdown (1-4): determines which move slot triggerbot presses on
     }
 end
 
-settingsRefs.triggerbot2Key = createKeybind(tabFrames.misc, "Move 2 Keybind", 620, tbState.key2, function(key)
+settingsRefs.triggerbotReactOnBlock = createToggle(tabFrames.misc, "React on block (Move 1)", 620, tbState.reactOnBlock[1], function(state)
+    tbState.reactOnBlock[1] = state
+    autoSaveSettings()
+end)
+
+settingsRefs.triggerbot2Key = createKeybind(tabFrames.misc, "Move 2 Keybind", 656, tbState.key2, function(key)
     tbState.key2 = key
 end)
 
 do -- Move slot 2 dropdown (1-4): second triggerbot channel's move
     local slotFrame = Instance.new("Frame")
     slotFrame.Size = UDim2.new(1, 0, 0, 32)
-    slotFrame.Position = UDim2.new(0, 0, 0, 656)
+    slotFrame.Position = UDim2.new(0, 0, 0, 692)
     slotFrame.BackgroundTransparency = 1
     slotFrame.Parent = tabFrames.misc
 
@@ -5162,13 +5174,18 @@ do -- Move slot 2 dropdown (1-4): second triggerbot channel's move
     }
 end
 
-settingsRefs.triggerbotUnblockOnUse = createToggle(tabFrames.misc, "Unblock on use", 692, tbState.unblockOnUse, function(state)
+settingsRefs.triggerbot2ReactOnBlock = createToggle(tabFrames.misc, "React on block (Move 2)", 728, tbState.reactOnBlock[2], function(state)
+    tbState.reactOnBlock[2] = state
+    autoSaveSettings()
+end)
+
+settingsRefs.triggerbotUnblockOnUse = createToggle(tabFrames.misc, "Unblock on use", 764, tbState.unblockOnUse, function(state)
     tbState.unblockOnUse = state
     autoSaveSettings()
 end)
 
-makeMiscHeader("Infinity", 734)
-local autoInfinityToggleObj = createToggle(tabFrames.misc, "AutoInfinity (JSON FILE)", 756, autoInfinityEnabled, function(state)
+makeMiscHeader("Infinity", 806)
+local autoInfinityToggleObj = createToggle(tabFrames.misc, "AutoInfinity (JSON FILE)", 828, autoInfinityEnabled, function(state)
     autoInfinityEnabled = state
     if state then
         autoInfinityLoadDatabase()
@@ -5182,32 +5199,32 @@ local autoInfinityToggleObj = createToggle(tabFrames.misc, "AutoInfinity (JSON F
 end)
 settingsRefs.autoInfinityEnabled = autoInfinityToggleObj
 
-settingsRefs.autoInfinityKey = createKeybind(tabFrames.misc, "AutoInfinity Keybind", 792, autoInfinityKey, function(key)
+settingsRefs.autoInfinityKey = createKeybind(tabFrames.misc, "AutoInfinity Keybind", 864, autoInfinityKey, function(key)
     autoInfinityKey = key
 end)
 
-settingsRefs.autoInfinityLookSensitivity = createSlider(tabFrames.misc, "Look sensitivity", 828, 0.1, 1.0, aiState.lookSensitivity, function(val)
+settingsRefs.autoInfinityLookSensitivity = createSlider(tabFrames.misc, "Look sensitivity", 900, 0.1, 1.0, aiState.lookSensitivity, function(val)
     aiState.lookSensitivity = val
 end, function(text, val)
     local deg = math.deg(math.acos(math.clamp(val, 0, 1)))
     return text .. ": " .. string.format("%.2f", val) .. string.format(" (%.0f degrees)", deg)
 end)
 
-settingsRefs.autoInfinityRayRadius = createSlider(tabFrames.misc, "Ray cast sensitivity", 876, 10, 100, aiState.rayRadius, function(val)
+settingsRefs.autoInfinityRayRadius = createSlider(tabFrames.misc, "Ray cast sensitivity", 948, 10, 100, aiState.rayRadius, function(val)
     aiState.rayRadius = val
 end)
 
-settingsRefs.autoInfinityUnlocked = createToggle(tabFrames.misc, "Autoinfinity unblock", 924, autoInfinityUnlocked, function(state)
+settingsRefs.autoInfinityUnlocked = createToggle(tabFrames.misc, "Autoinfinity unblock", 996, autoInfinityUnlocked, function(state)
     autoInfinityUnlocked = state
 end)
 
-makeMiscHeader("Utility", 962)
-settingsRefs.autoBlackFlashEnabled = createToggle(tabFrames.misc, "Auto Black Flash", 984, autoBlackFlashEnabled, function(state)
+makeMiscHeader("Utility", 1034)
+settingsRefs.autoBlackFlashEnabled = createToggle(tabFrames.misc, "Auto Black Flash", 1056, autoBlackFlashEnabled, function(state)
     autoBlackFlashEnabled = state
 	applyBlackFlashHook()
 end)
 
-settingsRefs.autoSprintEnabled = createToggle(tabFrames.misc, "Auto Sprint", 1020, autoState.sprintEnabled, function(state)
+settingsRefs.autoSprintEnabled = createToggle(tabFrames.misc, "Auto Sprint", 1092, autoState.sprintEnabled, function(state)
     autoState.sprintEnabled = state
     if not state and autoState.sprintHeld then
         autoState.sprintHeld = false
@@ -5215,11 +5232,11 @@ settingsRefs.autoSprintEnabled = createToggle(tabFrames.misc, "Auto Sprint", 102
     end
     autoSaveSettings()
 end)
-settingsRefs.autoPlayEnabled = createToggle(tabFrames.misc, "Auto Play", 1056, autoPlayEnabled, function(state)
+settingsRefs.autoPlayEnabled = createToggle(tabFrames.misc, "Auto Play", 1128, autoPlayEnabled, function(state)
     autoPlayEnabled = state
 end)
 
-settingsRefs.toggleUIKey = createKeybind(tabFrames.misc, "Close/Open UI", 1092, toggleUIKey, function(key)
+settingsRefs.toggleUIKey = createKeybind(tabFrames.misc, "Close/Open UI", 1164, toggleUIKey, function(key)
     toggleUIKey = key
 end)
 
@@ -5353,7 +5370,7 @@ if oldTB then oldTB:Destroy() end
 local tbContainer = Instance.new("Frame")
 tbContainer.Name = "TargetBanContainer"
 tbContainer.Size = UDim2.new(1, 0, 0, 186)
-tbContainer.Position = UDim2.new(0, 0, 0, 1094)
+tbContainer.Position = UDim2.new(0, 0, 0, 1166)
 tbContainer.BackgroundTransparency = 1
 tbContainer.ClipsDescendants = false
 tbContainer.Parent = tabFrames.misc
@@ -5775,7 +5792,7 @@ end))
 -- PS Code Snatch Button
 local snatchBtn = Instance.new("TextButton")
 snatchBtn.Size = UDim2.new(1, 0, 0, 32)
-snatchBtn.Position = UDim2.new(0, 0, 0, 1324)
+snatchBtn.Position = UDim2.new(0, 0, 0, 1396)
 snatchBtn.BackgroundColor3 = Color3.fromRGB(115, 95, 230) -- Purple theme
 snatchBtn.Text = "PS Code Snatch"
 snatchBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -5787,7 +5804,7 @@ local snatchCorner = Instance.new("UICorner") snatchCorner.CornerRadius = UDim.n
 -- Test Hold Block button (holds the script block key until repressed; for triggerbot testing)
 local testHoldBtn = Instance.new("TextButton")
 testHoldBtn.Size = UDim2.new(1, 0, 0, 32)
-testHoldBtn.Position = UDim2.new(0, 0, 0, 1360)
+testHoldBtn.Position = UDim2.new(0, 0, 0, 1432)
 testHoldBtn.BackgroundColor3 = Color3.fromRGB(115, 95, 230) -- Purple theme
 testHoldBtn.Text = "Hold Block (Test)"
 testHoldBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -5996,7 +6013,7 @@ end)
 
 local nanamiBtn = Instance.new("TextButton")
 nanamiBtn.Size = UDim2.new(1, 0, 0, 32)
-nanamiBtn.Position = UDim2.new(0, 0, 0, 1288)
+nanamiBtn.Position = UDim2.new(0, 0, 0, 1360)
 nanamiBtn.BackgroundColor3 = Color3.fromRGB(115, 95, 230) -- Purple theme
 nanamiBtn.Text = "Auto Nanami"
 nanamiBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -6012,7 +6029,7 @@ end)
 -- Unload button inside Misc tab
 local unloadBtn = Instance.new("TextButton")
 unloadBtn.Size = UDim2.new(1, 0, 0, 32)
-unloadBtn.Position = UDim2.new(0, 0, 0, 1396)
+unloadBtn.Position = UDim2.new(0, 0, 0, 1468)
 unloadBtn.BackgroundColor3 = Color3.fromRGB(240, 80, 80)
 unloadBtn.Text = "Unload UI"
 unloadBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -6026,7 +6043,7 @@ end)
 
 local creditsLabel = Instance.new("TextLabel")
 creditsLabel.Size = UDim2.new(1, 0, 0, 20)
-creditsLabel.Position = UDim2.new(0, 0, 0, 1432)
+creditsLabel.Position = UDim2.new(0, 0, 0, 1504)
 creditsLabel.BackgroundTransparency = 1
 creditsLabel.Text = "Credits: @ace_rsss & kyoka"
 creditsLabel.TextColor3 = Color3.fromRGB(120, 120, 120)
@@ -9072,7 +9089,7 @@ end
 -- while its key was pressed (pending request): it presses its own slot,
 -- confirms via that slot's cooldown, retries swallowed presses and clears
 -- the request once resolved.
-local function evalTriggerChannel(idx, now, markChanged, justUnblocked)
+local function evalTriggerChannel(idx, now, markChanged, edge, targetBlocking)
 	local slot = (idx == 2) and tbState.slot2 or tbState.slot
 	local pending = (idx == 2) and tbState.pending2 or tbState.pending1
 	if not pending then return end
@@ -9118,8 +9135,13 @@ local function evalTriggerChannel(idx, now, markChanged, justUnblocked)
 		end
 		return
 	end
+	-- Per-channel reaction mode. Default channels answer an opening (target not
+	-- blocking); "React on block" channels answer the guard itself and only
+	-- fire while it is up. The edge (unblock / block) bypasses the refire
+	-- cadence so the answer lands on the frame the target's state flips.
+	if tbState.reactOnBlock[idx] ~= targetBlocking then return end
 	local lastFire = (idx == 2) and tbState.lastFire2 or tbState.lastFire
-	if markChanged or justUnblocked or (now - lastFire > tbState.refire) then
+	if markChanged or edge or (now - lastFire > tbState.refire) then
 		if isOwnSlotOnCooldown(slot) or anyRecentCast(now) then
 			-- Own move still cooling (or a cast just started): hold (stay armed)
 			return
@@ -9310,14 +9332,17 @@ end
 
 	local blocking = isTriggerBlocking(mchar)
 	local justUnblocked = tbState.wasBlocking and not blocking
+	local justBlocked = (not tbState.wasBlocking) and blocking
 	tbState.wasBlocking = blocking
-	if blocking then
-		-- Target re-blocked mid-session: the guard drop only ever existed to
-		-- fire, so put it back; the session stays armed for the next opening.
-		if tbState.unblock[1] then resolveChannelUnblock(1) end
-		if tbState.unblock[2] then resolveChannelUnblock(2) end
-		return
-	end
+	-- A guard drop only ever existed to let a shot through in the state the
+	-- channel reacts to, so hand the guard back when the target flips to the
+	-- other state. Default channels drop while the target is open and restore
+	-- on the re-block; "React on block" channels drop while the target holds
+	-- block and restore when it comes down. No early return here: a "React on
+	-- block" channel fires on this very edge, and the per-channel gate in
+	-- evalTriggerChannel keeps the default channels idle while the guard is up.
+	if tbState.unblock[1] and blocking ~= tbState.reactOnBlock[1] then resolveChannelUnblock(1) end
+	if tbState.unblock[2] and blocking ~= tbState.reactOnBlock[2] then resolveChannelUnblock(2) end
 
 	-- On-screen gate: only fire while the locked target is actually on screen,
 	-- so it never goes off when they are behind you or off camera.
@@ -9337,8 +9362,8 @@ end
 	-- counts once the slot's Backpack Configuration actually gains its COOLDOWN
 	-- attribute. Swallowed presses never show one, so the channel stays armed
 	-- and retries instead of disabling.
-	evalTriggerChannel(1, now, markChanged, justUnblocked)
-	evalTriggerChannel(2, now, markChanged, justUnblocked)
+	evalTriggerChannel(1, now, markChanged, tbState.reactOnBlock[1] and justBlocked or justUnblocked, blocking)
+	evalTriggerChannel(2, now, markChanged, tbState.reactOnBlock[2] and justBlocked or justUnblocked, blocking)
 end))
 
 -- Auto M1 Loop (left click with skill priority)
